@@ -3024,6 +3024,11 @@ def create_gui(theme, logs_in_gui=False):
                             height=120,
                         )
                         voice_sample_status = gr.Markdown("")
+                        map_samples_button = gr.Button(
+                            "\U0001F501 Map Uploaded Samples to Speakers",
+                            visible=False,
+                            elem_id="map_samples_button",
+                        )
 
                         speaker_gender_info = gr.Markdown(
                             "Run translation first to see speaker analysis."
@@ -3127,6 +3132,7 @@ def create_gui(theme, logs_in_gui=False):
                             updates.append(gr.update(value="No speakers detected."))
                             updates.append(gr.update(visible=True))
                             updates.append(gr.update(value=sample_status))
+                            updates.append(gr.update(visible=False))  # map_samples_button
                             return updates
 
                         # Auto-map speakers to voices by gender and script
@@ -3210,6 +3216,7 @@ def create_gui(theme, logs_in_gui=False):
                         updates.append(gr.update(value=summary))
                         updates.append(gr.update(visible=True))
                         updates.append(gr.update(value=sample_status))
+                        updates.append(gr.update(visible=True))  # map_samples_button
                         return updates
 
                     def continue_with_confirmed_voices(*dropdown_values):
@@ -4049,7 +4056,6 @@ def create_gui(theme, logs_in_gui=False):
                 is_gui_dummy_check,
             ],
             outputs=[video_output, video_button],
-            trigger_mode="multiple",
         ).then(
             show_speaker_assignments,
             inputs=[voice_sample_files],
@@ -4060,7 +4066,7 @@ def create_gui(theme, logs_in_gui=False):
                     row["f0"], row["script"], row["sample"],
                     row["audio"], row["source"], row["voice"],
                 ]
-            ] + [speaker_gender_info, confirm_voices_button, voice_sample_status],
+            ] + [speaker_gender_info, confirm_voices_button, voice_sample_status, map_samples_button],
         ).then(
             play_sound_alert, [play_sound_gui], [sound_alert_notification]
         )
@@ -4092,7 +4098,20 @@ def create_gui(theme, logs_in_gui=False):
                     row["f0"], row["script"], row["sample"],
                     row["audio"], row["source"], row["voice"],
                 ]
-            ] + [speaker_gender_info, confirm_voices_button, voice_sample_status],
+            ] + [speaker_gender_info, confirm_voices_button, voice_sample_status, map_samples_button],
+        )
+
+        # Manual "Map Samples to Speakers" button
+        map_samples_button.click(
+            show_speaker_assignments,
+            inputs=[voice_sample_files],
+            outputs=[
+                comp for row in speaker_review_rows for comp in [
+                    row["row"], row["label"], row["gender"],
+                    row["f0"], row["script"], row["sample"],
+                    row["audio"], row["source"], row["voice"],
+                ]
+            ] + [speaker_gender_info, confirm_voices_button, voice_sample_status, map_samples_button],
         )
 
         # Pre-build voice choices for per-speaker source change (avoid importing on each change)
