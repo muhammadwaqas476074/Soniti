@@ -2998,17 +2998,10 @@ def create_gui(theme, logs_in_gui=False):
                     ):
                         gr.Markdown(
                             "**Pipeline pauses here after gender detection.**\n"
-                            "1. Choose voice source: **Coqui XTTS** (default) or **Audio Sample** (upload .wav/.mp3).\n"
-                            "2. For Audio Sample: Name each file as `Name-gender.wav` (e.g. `Abhinav-male.wav`, `priya-female.wav`).\n"
-                            "3. System auto-maps speakers to voices by gender.\n"
+                            "1. Upload voice samples (optional): Name files as `Name-gender.wav`.\n"
+                            "2. For each speaker, choose voice source: **Coqui XTTS** or **Audio Sample**.\n"
+                            "3. System auto-maps speakers to voices by gender & script.\n"
                             "4. **Adjust mappings** if needed, then click **Confirm Voices & Start TTS**."
-                        )
-
-                        voice_mode = gr.Radio(
-                            choices=["Coqui XTTS", "Audio Sample"],
-                            value="Coqui XTTS",
-                            label="Voice Source",
-                            info="Coqui XTTS: Use pre-trained XTTS voices | Audio Sample: Upload your own voice samples",
                         )
 
                         voice_sample_files = gr.File(
@@ -3016,15 +3009,7 @@ def create_gui(theme, logs_in_gui=False):
                             file_count="multiple",
                             file_types=[".wav", ".mp3", ".ogg", ".m4a"],
                             height=120,
-                            visible=False,
                         )
-                        with gr.Row():
-                            match_samples_button = gr.Button(
-                                "Match Samples to Speakers",
-                                variant="secondary",
-                                size="sm",
-                                visible=False,
-                            )
                         voice_sample_status = gr.Markdown("")
 
                         speaker_gender_info = gr.Markdown(
@@ -3045,10 +3030,18 @@ def create_gui(theme, logs_in_gui=False):
                                     visible=True,
                                     type="filepath",
                                 )
+                                spk_source = gr.Dropdown(
+                                    choices=["Coqui XTTS", "Audio Sample"],
+                                    value="Coqui XTTS",
+                                    label="Voice Source",
+                                    interactive=True,
+                                    scale=1,
+                                )
                                 spk_voice = gr.Dropdown(
                                     choices=[],
                                     label="Assigned Voice",
                                     interactive=True,
+                                    scale=2,
                                 )
                             speaker_review_rows.append({
                                 "row": spk_row,
@@ -3058,6 +3051,7 @@ def create_gui(theme, logs_in_gui=False):
                                 "script": spk_script,
                                 "sample": spk_sample,
                                 "audio": spk_audio,
+                                "source": spk_source,
                                 "voice": spk_voice,
                             })
 
@@ -3067,106 +3061,68 @@ def create_gui(theme, logs_in_gui=False):
                             visible=False,
                         )
 
-                    def show_speaker_assignments(uploaded_files, voice_mode="Coqui XTTS"):
+                    def show_speaker_assignments(uploaded_files):
                         """Populate the review panel after gender detection completes.
                         
-                        Args:
-                            uploaded_files: List of uploaded voice sample files
-                            voice_mode: "Coqui XTTS" or "Audio Sample"
+                        Each speaker has their own voice source selection (XTTS or Audio Sample).
                         """
                         updates = []
                         
-                        # Build choices based on mode
-                        voice_choices = [""]
-                        voice_samples = []
-                        sample_status = ""
+                        # Always build both choice lists
+                        from soni_translate.speaker_gender import (
+                            get_default_voice_for_script,
+                            get_available_voices_for_target,
+                            parse_uploaded_voice_samples,
+                        )
                         
-                        if voice_mode == "Audio Sample":
-                            # Use uploaded voice samples
-                            if uploaded_files:
-                                from soni_translate.speaker_gender import (
-                                    parse_uploaded_voice_samples,
-                                )
-                                file_paths = [f if isinstance(f, str) else f.name for f in uploaded_files]
-                                voice_samples, samples_by_gender = parse_uploaded_voice_samples(file_paths)
-                                SoniTr._voice_samples = voice_samples
-                                voice_choices = [""] + [
-                                    f"{s['identity']}-{s['gender']}" for s in voice_samples
-                                ]
-                                status_parts = [f"**{len(voice_samples)} samples loaded:**"]
-                                for s in voice_samples:
-                                    status_parts.append(f"  - {s['identity']} ({s['gender']})")
-                                sample_status = "\n".join(status_parts)
-                            else:
-                                SoniTr._voice_samples = []
-                                sample_status = "*No voice samples uploaded. Upload .wav/.mp3 files named `Name-gender.wav`.*"
-                        else:
-                            # Use Coqui XTTS voices (Edge TTS voices with gender info)
-                            from soni_translate.speaker_gender import get_available_voices_for_target
-                            
-                            # Get target language from SoniTr
-                            target_lang = getattr(SoniTr, '_target_lang', 'hi')
-                            
-                            # Get available voices for target language
-                            edge_voices = get_available_voices_for_target(target_lang, engine="edge")
-                            male_voices = edge_voices.get("male", [])
-                            female_voices = edge_voices.get("female", [])
-                            
-                            # Build choices with gender info
-                            voice_choices = [""] + [
-                                f"{v}" for v in male_voices + female_voices
+                        target_lang = getattr(SoniTr, '_target_lang', 'hi')
+                        
+                        # Build XTTS voice choices (Edge TTS)
+                        edge_voices = get_available_voices_for_target(target_lang, engine="edge")
+                        xtts_choices = [""] + edge_voices.get("male", []) + edge_voices.get("female", [])
+                        
+                        # Build Audio Sample choices
+                        voice_samples = []
+                        sample_choices = [""]
+                        if uploaded_files:
+                            file_paths = [f if isinstance(f, str) else f.name for f in uploaded_files]
+                            voice_samples, samples_by_gender = parse_uploaded_voice_samples(file_paths)
+                            SoniTr._voice_samples = voice_samples
+                            sample_choices = [""] + [
+                                f"{s['identity']}-{s['gender']}" for s in voice_samples
                             ]
-                            SoniTr._voice_samples = []  # No samples in XTTS mode
-                            sample_status = (
-                                f"**{len(male_voices)} male + {len(female_voices)} female XTTS voices available.**\n"
-                                "Auto-assigned by gender. Adjust if needed."
-                            )
+                            status_parts = [f"**{len(voice_samples)} samples loaded:**"]
+                            for s in voice_samples:
+                                status_parts.append(f"  - {s['identity']} ({s['gender']})")
+                            sample_status = "\n".join(status_parts)
+                        else:
+                            SoniTr._voice_samples = []
+                            sample_status = "*Upload .wav/.mp3 files named `Name-gender.wav` to use Audio Samples.*"
 
                         if not hasattr(SoniTr, 'speaker_info') or not SoniTr.speaker_info:
-                            # No speakers detected — hide all 12 rows + info + button
                             for _ in range(12):
                                 updates.extend([
                                     gr.update(visible=False),  # row
-                                    gr.update(),               # label
-                                    gr.update(),               # gender
-                                    gr.update(),               # f0
-                                    gr.update(),               # script
-                                    gr.update(),               # sample
-                                    gr.update(),               # audio
-                                    gr.update(),               # voice dropdown
+                                    gr.update(), gr.update(), gr.update(),
+                                    gr.update(), gr.update(), gr.update(),
+                                    gr.update(), gr.update(),  # source, voice
                                 ])
                             updates.append(gr.update(value="No speakers detected."))
-                            updates.append(gr.update(visible=False))
+                            updates.append(gr.update(visible=True))
                             updates.append(gr.update(value=sample_status))
                             return updates
 
                         # Auto-map speakers to voices by gender and script
-                        from soni_translate.speaker_gender import (
-                            get_default_voice_for_script,
-                            get_available_voices_for_target,
-                        )
-                        target_lang = getattr(SoniTr, '_target_lang', 'hi')
-                        
-                        if voice_mode == "Audio Sample" and voice_samples:
-                            from soni_translate.speaker_gender import auto_map_speakers_to_samples
-                            auto = auto_map_speakers_to_samples(
-                                SoniTr.speaker_info, samples_by_gender
-                            )
+                        auto = getattr(SoniTr, 'auto_voice_assignments', {})
+                        if not auto:
+                            auto = {}
+                            for spk, info in SoniTr.speaker_info.items():
+                                gender = info.get("gender", "male")
+                                script = info.get("script", "unknown")
+                                auto[spk] = get_default_voice_for_script(
+                                    script, gender, target_lang
+                                )
                             SoniTr.auto_voice_assignments = auto
-                        else:
-                            # Use existing auto-assignments (from Edge TTS or previous assignment)
-                            auto = getattr(SoniTr, 'auto_voice_assignments', {})
-                            if not auto:
-                                # If no existing assignments, create new ones based on gender AND script
-                                auto = {}
-                                for spk, info in SoniTr.speaker_info.items():
-                                    gender = info.get("gender", "male")
-                                    script = info.get("script", "unknown")
-                                    # Get default voice based on script and gender
-                                    auto[spk] = get_default_voice_for_script(
-                                        script, gender, target_lang
-                                    )
-                                SoniTr.auto_voice_assignments = auto
 
                         speakers = sorted(SoniTr.speaker_info.keys())
 
@@ -3177,40 +3133,38 @@ def create_gui(theme, logs_in_gui=False):
                                 gender = info.get("gender", "unknown")
                                 f0 = info.get("f0")
                                 f0_str = f"{f0:.1f} Hz" if f0 else "N/A"
-                                sample = info.get("sample_audio")
+                                sample_audio = info.get("sample_audio")
                                 assigned_voice = auto.get(spk, "")
                                 
-                                # Script analysis info
                                 script = info.get("script", "unknown")
-                                script_desc = info.get("script_description", "No text")
                                 script_sample = info.get("script_sample", "")
                                 
-                                if gender == "male":
-                                    gender_text = "Male"
-                                elif gender == "female":
-                                    gender_text = "Female"
-                                else:
-                                    gender_text = "Unknown"
+                                gender_text = "Male" if gender == "male" else "Female" if gender == "female" else "Unknown"
                                 
-                                # Script display
                                 if script == "devanagari":
-                                    script_text = f"**Script:** Devanagari/Hindi"
+                                    script_text = "**Script:** Devanagari/Hindi"
                                 elif script == "latin":
-                                    script_text = f"**Script:** English/Latin"
+                                    script_text = "**Script:** English/Latin"
                                 elif script == "urdu":
-                                    script_text = f"**Script:** Urdu"
+                                    script_text = "**Script:** Urdu"
                                 elif script == "mixed":
-                                    script_text = f"**Script:** Mixed (Hindi + English)"
+                                    script_text = "**Script:** Mixed (Hindi + English)"
                                 else:
-                                    script_text = f"**Script:** Unknown"
+                                    script_text = "**Script:** Unknown"
                                 
-                                # Sample display
-                                if script_sample:
-                                    sample_display = f"*Sample:* `{script_sample}`"
-                                else:
-                                    sample_display = "*Sample:* —"
+                                sample_display = f"*Sample:* `{script_sample}`" if script_sample else "*Sample:* —"
 
-                                # Set voice dropdown value
+                                # Determine source based on assigned_voice
+                                if assigned_voice.startswith("_XTTS_/") or assigned_voice in xtts_choices:
+                                    source_val = "Coqui XTTS"
+                                    voice_choices = xtts_choices
+                                elif assigned_voice in sample_choices:
+                                    source_val = "Audio Sample"
+                                    voice_choices = sample_choices
+                                else:
+                                    source_val = "Coqui XTTS"
+                                    voice_choices = xtts_choices
+
                                 voice_val = assigned_voice if assigned_voice in voice_choices else None
 
                                 updates.extend([
@@ -3220,20 +3174,21 @@ def create_gui(theme, logs_in_gui=False):
                                     gr.update(value=f"F0: {f0_str}"),
                                     gr.update(value=script_text),
                                     gr.update(value=sample_display),
-                                    gr.update(value=sample if sample and os.path.exists(sample) else None),
+                                    gr.update(value=sample_audio if sample_audio and os.path.exists(sample_audio) else None),
+                                    gr.update(value=source_val),
                                     gr.update(choices=voice_choices, value=voice_val),
                                 ])
                             else:
                                 updates.extend([
                                     gr.update(visible=False),
                                     gr.update(), gr.update(), gr.update(),
-                                    gr.update(), gr.update(), gr.update(), gr.update(),
+                                    gr.update(), gr.update(), gr.update(),
+                                    gr.update(), gr.update(),
                                 ])
 
                         summary = (
                             f"**{len(speakers)} speakers detected.** "
-                            f"Mode: **{voice_mode}**. "
-                            "Review and adjust mappings below, then confirm."
+                            "Choose voice source per-speaker (XTTS or Audio Sample), then confirm."
                         )
                         updates.append(gr.update(value=summary))
                         updates.append(gr.update(visible=True))
@@ -4073,13 +4028,13 @@ def create_gui(theme, logs_in_gui=False):
             trigger_mode="multiple",
         ).then(
             show_speaker_assignments,
-            inputs=[voice_sample_files, voice_mode],
+            inputs=[voice_sample_files],
             outputs=[
-                # 12 speaker rows x 6 components each
+                # 12 speaker rows x 9 components each
                 comp for row in speaker_review_rows for comp in [
                     row["row"], row["label"], row["gender"],
                     row["f0"], row["script"], row["sample"],
-                    row["audio"], row["voice"],
+                    row["audio"], row["source"], row["voice"],
                 ]
             ] + [speaker_gender_info, confirm_voices_button, voice_sample_status],
         ).then(
@@ -4103,64 +4058,54 @@ def create_gui(theme, logs_in_gui=False):
             cancels=[video_button_event],
         )
 
-        # Match samples to speakers — manual trigger after upload
-        match_samples_button.click(
-            show_speaker_assignments,
-            inputs=[voice_sample_files, voice_mode],
-            outputs=[
-                comp for row in speaker_review_rows for comp in [
-                    row["row"], row["label"], row["gender"],
-                    row["f0"], row["script"], row["sample"],
-                    row["audio"], row["voice"],
-                ]
-            ] + [speaker_gender_info, confirm_voices_button, voice_sample_status],
-        )
-
-        # Auto-match when samples are uploaded (even during translation)
+        # Auto-match when samples are uploaded
         voice_sample_files.change(
             show_speaker_assignments,
-            inputs=[voice_sample_files, voice_mode],
+            inputs=[voice_sample_files],
             outputs=[
                 comp for row in speaker_review_rows for comp in [
                     row["row"], row["label"], row["gender"],
                     row["f0"], row["script"], row["sample"],
-                    row["audio"], row["voice"],
+                    row["audio"], row["source"], row["voice"],
                 ]
             ] + [speaker_gender_info, confirm_voices_button, voice_sample_status],
         )
 
-        # Toggle visibility of upload section based on voice mode
-        def _on_voice_mode_change(mode):
-            """Show/hide upload section based on voice mode selection."""
-            if mode == "Audio Sample":
-                return (
-                    gr.update(visible=True),   # voice_sample_files
-                    gr.update(visible=True),   # match_samples_button
-                )
+        # Per-speaker source change: update voice dropdown choices
+        def _on_speaker_source_change(speaker_idx, uploaded_files):
+            """When user changes source for a specific speaker, update voice dropdown."""
+            from soni_translate.speaker_gender import (
+                get_available_voices_for_target,
+            )
+            
+            target_lang = getattr(SoniTr, '_target_lang', 'hi')
+            
+            if speaker_idx is None:
+                return gr.update()
+            
+            if speaker_idx == "Audio Sample":
+                # Build sample choices
+                if uploaded_files:
+                    from soni_translate.speaker_gender import parse_uploaded_voice_samples
+                    file_paths = [f if isinstance(f, str) else f.name for f in uploaded_files]
+                    voice_samples, _ = parse_uploaded_voice_samples(file_paths)
+                    choices = [""] + [f"{s['identity']}-{s['gender']}" for s in voice_samples]
+                else:
+                    choices = [""]
             else:
-                return (
-                    gr.update(visible=False),  # voice_sample_files
-                    gr.update(visible=False),  # match_samples_button
-                )
+                # Build XTTS choices
+                edge_voices = get_available_voices_for_target(target_lang, engine="edge")
+                choices = [""] + edge_voices.get("male", []) + edge_voices.get("female", [])
+            
+            return gr.update(choices=choices, value=None)
 
-        voice_mode.change(
-            _on_voice_mode_change,
-            inputs=[voice_mode],
-            outputs=[voice_sample_files, match_samples_button],
-        )
-
-        # Also update speaker assignments when voice mode changes
-        voice_mode.change(
-            show_speaker_assignments,
-            inputs=[voice_sample_files, voice_mode],
-            outputs=[
-                comp for row in speaker_review_rows for comp in [
-                    row["row"], row["label"], row["gender"],
-                    row["f0"], row["script"], row["sample"],
-                    row["audio"], row["voice"],
-                ]
-            ] + [speaker_gender_info, confirm_voices_button, voice_sample_status],
-        )
+        # Add per-speaker source change handlers
+        for idx, row in enumerate(speaker_review_rows):
+            row["source"].change(
+                _on_speaker_source_change,
+                inputs=[row["source"], voice_sample_files],
+                outputs=[row["voice"]],
+            )
 
         # ---- Upload-awareness: disable translate while file is uploading ----
         def _on_file_change(files):

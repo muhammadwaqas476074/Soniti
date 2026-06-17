@@ -184,32 +184,20 @@ TARGET_VOICE_MAP = {
         "male": [
             "hi-IN-MadhurNeural-Male",
             "hi-IN-PrabhatNeural-Male",
-            "en-IN-PrabhatNeural-Male",
-            "bn-IN-BashkarNeural-Male",
-            "gu-IN-NiranjanNeural-Male",
-            "kn-IN-GaganNeural-Male",
-            "ml-IN-MidhunNeural-Male",
-            "mr-IN-ManoharNeural-Male",
-            "ta-IN-ValluvarNeural-Male",
-            "te-IN-MohanNeural-Male",
-            "ur-IN-SalmanNeural-Male",
             "en-US-AndrewMultilingualNeural-Male",
             "en-US-BrianMultilingualNeural-Male",
+            "en-IN-PrabhatNeural-Male",
+            "mr-IN-ManoharNeural-Male",
+            "ur-IN-SalmanNeural-Male",
         ],
         "female": [
             "hi-IN-SwaraNeural-Female",
-            "en-IN-NeerjaNeural-Female",
-            "en-IN-NeerjaExpressiveNeural-Female",
-            "bn-IN-TanishaaNeural-Female",
-            "gu-IN-DhwaniNeural-Female",
-            "kn-IN-SapnaNeural-Female",
-            "ml-IN-SobhanaNeural-Female",
-            "mr-IN-AarohiNeural-Female",
-            "ta-IN-PallaviNeural-Female",
-            "te-IN-ShrutiNeural-Female",
-            "ur-IN-GulNeural-Female",
             "en-US-EmmaMultilingualNeural-Female",
             "en-US-AvaMultilingualNeural-Female",
+            "en-IN-NeerjaNeural-Female",
+            "en-IN-NeerjaExpressiveNeural-Female",
+            "mr-IN-AarohiNeural-Female",
+            "ur-IN-GulNeural-Female",
         ],
         "male_bark": [
             "hi_speaker_2-Male BARK",
@@ -915,13 +903,13 @@ _DEVANAGARI_TO_LATIN = {
 def transliterate_latin_to_devanagari(text):
     """
     Transliterate Latin/English text to Devanagari script.
-    Uses approximate phonetic mapping.
+    Uses phonetic rules for Hindi transliteration.
     
     Args:
-        text: Latin script text (e.g., "namaste", "I am sorry")
+        text: Latin script text (e.g., "namaste", "sawal uth sakte hain")
     
     Returns:
-        str: Devanagari transliteration (e.g., "नमस्ते", "आई एम सॉरी")
+        str: Devanagari transliteration (e.g., "नमस्ते", "सवाल उठ सकते हैं")
     """
     if not text:
         return text
@@ -930,44 +918,146 @@ def transliterate_latin_to_devanagari(text):
     if re.search(r'[\u0900-\u097F]', text):
         return text
     
+    # Common Hindi words dictionary (for better accuracy)
+    word_dict = {
+        'hai': 'है', 'hain': 'हैं', 'ho': 'हो', 'tha': 'था', 'thi': 'थी',
+        'the': 'थे', 'kah': 'कह', 'kya': 'क्या', 'kab': 'कब', 'kaun': 'कौन',
+        'kyun': 'क्यों', 'kaise': 'कैसे', 'nahi': 'नहीं', 'nahin': 'नहीं',
+        'mai': 'मैं', 'main': 'मैं', 'mein': 'में', 'mera': 'मेरा', 'meri': 'मेरी',
+        'tera': 'तेरा', 'teri': 'तेरी', 'uska': 'उसका', 'uski': 'उसकी',
+        'yeh': 'यह', 'woh': 'वह', 'ye': 'ये', 'wo': 'वो',
+        'aur': 'और', 'ya': 'या', 'par': 'पर', 'pe': 'पे', 'ko': 'को',
+        'se': 'से', 'ke': 'के', 'ka': 'का', 'ki': 'की',
+        'abhi': 'अभी', 'bhi': 'भी', 'hi': 'ही', 'hiya': 'हिया',
+        'dekho': 'देखो', 'dekha': 'देखा', 'dekhiye': 'देखिए',
+        'bolo': 'बोलो', 'bola': 'बोला', 'boliye': 'बोलिए',
+        'chalo': 'चलो', 'chala': 'चला', 'chaliye': 'चलिए',
+        'aao': 'आओ', 'aaya': 'आया', 'aaiye': 'आइए',
+        'lo': 'लो', 'le': 'ले', 'de': 'दे', 'do': 'दो',
+        'raha': 'रहा', 'rahi': 'रही', 'rahe': 'रहे',
+        'sawal': 'सवाल', 'jawaab': 'जवाब', 'matlab': 'मतलब',
+        'samajh': 'समझ', 'samjho': 'समझो',
+        'bhai': 'भाई', 'behen': 'बहन', 'beta': 'बेटा', 'beti': 'बेटी',
+        'dost': 'दोस्त', 'yaar': 'यार', 'zindagi': 'ज़िंदगी',
+        'mohabbat': 'मोहब्बत', 'pyar': 'प्यार', 'ishq': 'इश्क',
+        'waqt': 'वक़्त', 'time': 'टाइम', 'din': 'दिन', 'raat': 'रात',
+        'subah': 'सुबह', 'shaam': 'शाम', 'dopahar': 'दोपहर',
+        'khana': 'खाना', 'pani': 'पानी', 'ghar': 'घर',
+        'kam': 'कम', 'zyaada': 'ज़्यादा', 'bahut': 'बहुत', 'thoda': 'थोड़ा',
+        'sab': 'सब', 'kuch': 'कुछ', 'har': 'हर', 'koi': 'कोई',
+        'kabhi': 'कभी', 'hamesha': 'हमेशा', 'aj': 'आज', 'kal': 'कल',
+        'suno': 'सुनो', 'sun': 'सुन', 'bol': 'बोल',
+        'chup': 'चुप', 'ruk': 'रुक', 'jao': 'जाओ', 'ja': 'जा',
+        'aaja': 'आजा', 'chale': 'चले', 'chaliye': 'चलिए',
+        'namaste': 'नमस्ते', 'pranam': 'प्रणाम', 'adab': 'अदब',
+        'shukriya': 'शुक्रिया', 'mehrbani': 'मेहरबानी',
+        'sorry': 'सॉरी', 'please': 'प्लीज़', 'excuse': 'एक्सक्यूज़',
+        'good': 'गुड', 'morning': 'मॉर्निंग', 'afternoon': 'आफ्टरनून',
+        'evening': 'इवनिंग', 'night': 'नाइट',
+        'thank': 'थैंक', 'you': 'यू', 'welcome': 'वेलकम',
+        'yes': 'हाँ', 'nahi': 'नहीं', 'theek': 'ठीक',
+        'accha': 'अच्छा', 'bura': 'बुरा', 'sundar': 'सुंदर',
+        'bada': 'बड़ा', 'chhota': 'छोटा', 'lamba': 'लंबा',
+        'kaisa': 'कैसा', 'aisa': 'ऐसा', 'waisa': 'वैसा',
+        'jaisा': 'जैसा', 'wahi': 'वही', 'yahi': 'यही',
+        'sirf': 'सिर्फ', 'bas': 'बस', 'ab': 'अब', 'tab': 'तब',
+        'phir': 'फिर', 'uske': 'उसके', 'iske': 'इसके',
+        'usmein': 'उसमें', 'ismein': 'इसमें',
+        'wahan': 'वहाँ', 'yahan': 'यहाँ', 'kahan': 'कहाँ',
+        'kabhi': 'कभी', 'kahin': 'कहीं', 'kahin': 'कहीं',
+        'uth': 'उठ', 'sakte': 'सकते', 'sakti': 'सकती',
+        'karna': 'करना', 'kare': 'करे', 'karo': 'करो',
+        'hona': 'होना', 'ho': 'हो', 'ho': 'हो',
+        'jana': 'जाना', 'aana': 'आना', 'lena': 'लेना', 'dena': 'देना',
+        'khana': 'खाना', 'peena': 'पीना', 'sona': 'सोना',
+        'padhna': 'पढ़ना', 'likhna': 'लिखना', 'bolna': 'बोलना',
+        'sunna': 'सुनना', 'dekna': 'देखना', 'marna': 'मारना',
+        'bhagna': 'भागना', 'rukhna': 'रुकना', 'baithna': 'बैठना',
+        'khada': 'खड़ा', 'baitha': 'बैठा', 'soya': 'सोया',
+        'khaya': 'खाया', 'piya': 'पिया', 'padha': 'पढ़ा',
+        'likha': 'लिखा', 'bola': 'बोला', 'suna': 'सुना',
+        'dekha': 'देखा', 'mara': 'मारा', 'bhaga': 'भागा',
+        'ruka': 'रुका', 'baitha': 'बैठा',
+    }
+    
+    # Transliteration rules (ordered by length for greedy matching)
+    rules = [
+        # Three-char combinations
+        ('ksh', 'क्ष'), ('shr', 'श्र'), ('gya', 'ज्ञ'),
+        # Two-char combinations
+        ('kh', 'ख'), ('gh', 'घ'), ('ch', 'च'), ('jh', 'झ'),
+        ('th', 'थ'), ('dh', 'ध'), ('ph', 'फ'), ('bh', 'भ'),
+        ('sh', 'श'), ('ng', 'ङ'), ('ny', 'ञ'),
+        ('ai', 'ऐ'), ('au', 'औ'), ('ee', 'ई'), ('oo', 'ऊ'),
+        ('aa', 'आ'), ('ii', 'ई'), ('uu', 'ऊ'),
+        # Single char vowels
+        ('a', 'अ'), ('i', 'इ'), ('u', 'उ'), ('e', 'ए'), ('o', 'ओ'),
+        # Single char consonants
+        ('k', 'क'), ('g', 'ग'), ('c', 'च'), ('j', 'ज'),
+        ('t', 'त'), ('d', 'द'), ('n', 'न'), ('p', 'प'),
+        ('b', 'ब'), ('m', 'म'), ('y', 'य'), ('r', 'र'),
+        ('l', 'ल'), ('v', 'व'), ('w', 'व'), ('s', 'स'),
+        ('h', 'ह'), ('f', 'फ़'), ('z', 'ज़'), ('x', 'क्स'),
+        ('q', 'क'),
+    ]
+    
+    words = text.split()
     result = []
-    i = 0
-    text_lower = text.lower()
     
-    while i < len(text_lower):
-        # Try two-char match first
-        if i + 1 < len(text_lower):
-            two_char = text_lower[i:i+2]
-            if two_char in _LATIN_TO_DEVANAGARI:
-                result.append(_LATIN_TO_DEVANAGARI[two_char])
-                i += 2
-                continue
+    for word in words:
+        word_lower = word.lower().strip('.,!?;:')
+        punct_after = ''
+        for ch in word:
+            if ch in '.,!?;:':
+                punct_after += ch
+            else:
+                break
         
-        # Try single-char match
-        char = text_lower[i]
-        if char in _LATIN_TO_DEVANAGARI:
-            result.append(_LATIN_TO_DEVANAGARI[char])
-        elif char.isalpha():
-            # Unknown Latin char, use placeholder
-            result.append(' ')
-        else:
-            # Keep punctuation, numbers, spaces
-            result.append(char)
-        i += 1
+        # Check dictionary first
+        if word_lower in word_dict:
+            result.append(word_dict[word_lower] + punct_after)
+            continue
+        
+        # Apply transliteration rules
+        devanagari = []
+        i = 0
+        while i < len(word_lower):
+            matched = False
+            # Try longer rules first
+            for length in [3, 2, 1]:
+                if i + length <= len(word_lower):
+                    chunk = word_lower[i:i+length]
+                    for rule_from, rule_to in rules:
+                        if chunk == rule_from:
+                            devanagari.append(rule_to)
+                            i += length
+                            matched = True
+                            break
+                if matched:
+                    break
+            if not matched:
+                # Unknown char, keep as-is or skip
+                if word_lower[i].isalpha():
+                    devanagari.append(word_lower[i])
+                else:
+                    devanagari.append(word_lower[i])
+                i += 1
+        
+        result.append(''.join(devanagari) + punct_after)
     
-    return ''.join(result)
+    return ' '.join(result)
 
 
 def transliterate_devanagari_to_latin(text):
     """
     Transliterate Devanagari text to Latin/English script.
-    Uses approximate phonetic mapping.
+    Uses phonetic mapping for Hindi.
     
     Args:
-        text: Devanagari script text (e.g., "नमस्ते")
+        text: Devanagari script text (e.g., "नमस्ते", "सवाल")
     
     Returns:
-        str: Latin transliteration (e.g., "namaste")
+        str: Latin transliteration (e.g., "namaste", "sawaal")
     """
     if not text:
         return text
@@ -976,15 +1066,41 @@ def transliterate_devanagari_to_latin(text):
     if re.search(r'[a-zA-Z]', text) and not re.search(r'[\u0900-\u097F]', text):
         return text
     
+    # Devanagari to Latin mapping
+    dev_to_lat = {
+        # Vowels
+        'अ': 'a', 'आ': 'aa', 'इ': 'i', 'ई': 'ee', 'उ': 'u', 'ऊ': 'oo',
+        'ए': 'e', 'ऐ': 'ai', 'ओ': 'o', 'औ': 'au',
+        'ऋ': 'ri', 'ॠ': 'ree', 'ऌ': 'li', 'ॡ': 'lee',
+        # Consonants
+        'क': 'ka', 'ख': 'kha', 'ग': 'ga', 'घ': 'gha', 'ङ': 'nga',
+        'च': 'cha', 'छ': 'chha', 'ज': 'ja', 'झ': 'jha', 'ञ': 'nya',
+        'ट': 'ta', 'ठ': 'tha', 'ड': 'da', 'ढ': 'dha', 'ण': 'na',
+        'त': 'ta', 'थ': 'tha', 'द': 'da', 'ध': 'dha', 'न': 'na',
+        'प': 'pa', 'फ': 'pha', 'ब': 'ba', 'भ': 'bha', 'म': 'ma',
+        'य': 'ya', 'र': 'ra', 'ल': 'la', 'व': 'va', 'श': 'sha',
+        'ष': 'sha', 'स': 'sa', 'ह': 'ha',
+        'फ़': 'fa', 'ज़': 'za', 'ग़': 'gha', 'ख़': 'kha',
+        'ड़': 'da', 'ढ़': 'dha',
+        # Matras (vowel signs)
+        'ा': 'aa', 'ि': 'i', 'ी': 'ee', 'ु': 'u', 'ू': 'oo',
+        'े': 'e', 'ै': 'ai', 'ो': 'o', 'ौ': 'au',
+        'ृ': 'ri', 'ॄ': 'ree', 'ॢ': 'li', 'ॣ': 'lee',
+        # Signs
+        'ं': 'n', 'ँ': 'm', 'ः': 'h', '़': '', 'ँ': 'm',
+        '्': '',  # Virama (halant) - suppress inherent 'a'
+        'ँ': 'm',
+    }
+    
     result = []
     for char in text:
-        if char in _DEVANAGARI_TO_LATIN:
-            result.append(_DEVANAGARI_TO_LATIN[char])
+        if char in dev_to_lat:
+            result.append(dev_to_lat[char])
         elif re.search(r'[\u0900-\u097F]', char):
-            # Unknown Devanagari char, skip
-            pass
+            # Unknown Devanagari char, try to approximate
+            result.append('')
         else:
-            # Keep punctuation, numbers, spaces
+            # Keep punctuation, numbers, spaces, Latin chars
             result.append(char)
     
     return ''.join(result)
