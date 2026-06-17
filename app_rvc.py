@@ -1228,6 +1228,7 @@ class SoniTranslate(SoniTrCache):
         base_video_file = "Video.mp4"
         base_audio_wav = "audio.wav"
         dub_audio_file = "audio_dub_solo.ogg"
+        active_dub_file = dub_audio_file  # tracks current working file (temp during processing)
         vocals_audio_file = "audio_Vocals_DeReverb.wav"
         voiceless_audio_file = "audio_Voiceless.wav"
         mix_audio_file = "audio_mix.mp3"
@@ -1888,11 +1889,14 @@ class SoniTranslate(SoniTrCache):
                 pr.done("custom_voices")
 
             pr.step("output", "Creating final translated audio...")
+            # Write to temp file first, rename to final path after ALL processing
+            dub_audio_temp = dub_audio_file + ".processing"
+            remove_files(dub_audio_temp)
             remove_files(dub_audio_file)
             create_translated_audio(
                 self.result_diarize,
                 audio_files,
-                dub_audio_file,
+                dub_audio_temp,
                 False,
                 avoid_overlap,
                 original_vocals_path=self.vocals if hasattr(self, 'vocals') and self.vocals else None,
@@ -1901,13 +1905,14 @@ class SoniTranslate(SoniTrCache):
             pr.done("output")
 
             # Audio enhancement: loudness normalization + room tone
-            if (use_loudness_normalization or use_room_tone) and os.path.exists(dub_audio_file):
+            active_dub_file = dub_audio_temp  # track which file is current
+            if (use_loudness_normalization or use_room_tone) and os.path.exists(active_dub_file):
                 pr.step("enhance", "Enhancing audio quality...")
-                enhanced_file = "audio_dub_enhanced.wav"
+                enhanced_file = "audio_dub_enhanced.wav.processing"
                 try:
                     enhanced_file = _enhance_dubbed_audio(
                         self.result_diarize,
-                        dub_audio_file,
+                        active_dub_file,
                         enhanced_file,
                         use_loudness_normalization,
                         use_room_tone,
@@ -1915,14 +1920,15 @@ class SoniTranslate(SoniTrCache):
                         audio_dir="audio",
                     )
                     if os.path.exists(enhanced_file):
-                        dub_audio_file = enhanced_file
-                        logger.info(f"Enhanced audio: {dub_audio_file}")
+                        remove_files(active_dub_file)
+                        active_dub_file = enhanced_file
+                        logger.info(f"Enhanced audio: {active_dub_file}")
                 except Exception as e:
                     logger.error(f"Audio enhancement failed: {e}")
                 pr.done("enhance")
 
             # Timing fixes: time-stretch TTS to fit slots
-            if use_loudness_normalization and os.path.exists(dub_audio_file):
+            if use_loudness_normalization and os.path.exists(active_dub_file):
                 pr.step("timing", "Adjusting timing...")
                 try:
                     _apply_timing_fixes(
@@ -1973,10 +1979,10 @@ class SoniTranslate(SoniTrCache):
             volume_translated_audio,
             voiceless_track
         ], {}):
-            # TYPE MIX AUDIO
+            # TYPE MIX AUDIO — use active_dub_file (temp path, not visible to Gradio yet)
             remove_files(mix_audio_file)
-            command_volume_mix = f'ffmpeg -y -i {base_audio_wav} -i {dub_audio_file} -filter_complex "[0:0]volume={volume_original_audio}[a];[1:0]volume={volume_translated_audio}[b];[a][b]amix=inputs=2:duration=longest" -c:a libmp3lame {mix_audio_file}'
-            command_background_mix = f'ffmpeg -i {base_audio_wav} -i {dub_audio_file} -filter_complex "[1:a]asplit=2[sc][mix];[0:a][sc]sidechaincompress=threshold=0.003:ratio=20[bg]; [bg][mix]amerge[final]" -map [final] {mix_audio_file}'
+            command_volume_mix = f'ffmpeg -y -i {base_audio_wav} -i {active_dub_file} -filter_complex "[0:0]volume={volume_original_audio}[a];[1:0]volume={volume_translated_audio}[b];[a][b]amix=inputs=2:duration=longest" -c:a libmp3lame {mix_audio_file}'
+            command_background_mix = f'ffmpeg -i {base_audio_wav} -i {active_dub_file} -filter_complex "[1:a]asplit=2[sc][mix];[0:a][sc]sidechaincompress=threshold=0.003:ratio=20[bg]; [bg][mix]amerge[final]" -map [final] {mix_audio_file}'
             if mix_method_audio == "Adjusting volumes and mixing audio":
                 # volume mix
                 run_command(command_volume_mix)
@@ -1988,6 +1994,13 @@ class SoniTranslate(SoniTrCache):
                     # volume mix except
                     logger.error(str(error_mix))
                     run_command(command_volume_mix)
+
+        # ALL processing done — now make the final audio file visible to Gradio
+        # Rename the temp file to the final path so Gradio serves the completed file
+        if os.path.exists(active_dub_file) and active_dub_file != dub_audio_file:
+            shutil.copy2(active_dub_file, dub_audio_file)
+            remove_files(active_dub_file)
+            logger.info(f"Final audio ready: {dub_audio_file}")
 
         if "audio" in output_type or is_audio_file(media_file):
             output = media_out(
@@ -3019,30 +3032,34 @@ def create_gui(theme, logs_in_gui=False):
                         speaker_review_rows = []
                         for i in range(12):
                             with gr.Row(visible=False) as spk_row:
-                                spk_label = gr.Markdown(f"**SPEAKER_{i:02d}**")
-                                spk_gender = gr.Markdown("—")
-                                spk_f0 = gr.Markdown("—")
-                                spk_script = gr.Markdown("—")
-                                spk_sample = gr.Markdown("*Sample: —*", elem_classes="script-sample")
-                                spk_audio = gr.Audio(
-                                    label="Demucs Vocal Sample",
-                                    interactive=False,
-                                    visible=True,
-                                    type="filepath",
-                                )
-                                spk_source = gr.Dropdown(
-                                    choices=["Coqui XTTS", "Audio Sample"],
-                                    value="Coqui XTTS",
-                                    label="Voice Source",
-                                    interactive=True,
-                                    scale=1,
-                                )
-                                spk_voice = gr.Dropdown(
-                                    choices=[],
-                                    label="Assigned Voice",
-                                    interactive=True,
-                                    scale=2,
-                                )
+                                # Row 1: Info
+                                with gr.Column(scale=3):
+                                    spk_label = gr.Markdown(f"**SPEAKER_{i:02d}**")
+                                    with gr.Row():
+                                        spk_gender = gr.Markdown("—")
+                                        spk_f0 = gr.Markdown("—")
+                                        spk_script = gr.Markdown("—")
+                                    spk_sample = gr.Markdown("*Sample: —*")
+                                # Row 2: Audio + Voice controls
+                                with gr.Column(scale=2):
+                                    spk_audio = gr.Audio(
+                                        label="Vocal Sample",
+                                        interactive=False,
+                                        visible=True,
+                                        type="filepath",
+                                    )
+                                    with gr.Row():
+                                        spk_source = gr.Dropdown(
+                                            choices=["Coqui XTTS", "Audio Sample"],
+                                            value="Coqui XTTS",
+                                            label="Source",
+                                            interactive=True,
+                                        )
+                                        spk_voice = gr.Dropdown(
+                                            choices=[],
+                                            label="Voice",
+                                            interactive=True,
+                                        )
                             speaker_review_rows.append({
                                 "row": spk_row,
                                 "label": spk_label,
@@ -3243,6 +3260,13 @@ def create_gui(theme, logs_in_gui=False):
                         try:
                             result = SoniTr.run_from_tts()
                             return result if result else ["outputs/done.txt"]
+                        except PipelineCancelled:
+                            logger.info("Pipeline cancelled by user during TTS phase")
+                            placeholder = "outputs/cancelled.txt"
+                            os.makedirs("outputs", exist_ok=True)
+                            with open(placeholder, "w") as f:
+                                f.write("TTS cancelled. Translation progress preserved.\n")
+                            return [placeholder]
                         except Exception as e:
                             logger.error(f"Pipeline continuation failed: {e}")
                             placeholder = "outputs/error.txt"
@@ -4042,7 +4066,7 @@ def create_gui(theme, logs_in_gui=False):
         )
 
         # Confirm voices — user reviewed, now continue to TTS
-        confirm_voices_button.click(
+        confirm_voices_event = confirm_voices_button.click(
             continue_with_confirmed_voices,
             inputs=[row["voice"] for row in speaker_review_rows],
             outputs=[video_output],
@@ -4055,7 +4079,7 @@ def create_gui(theme, logs_in_gui=False):
             SoniTr.cancel_pipeline,
             inputs=[],
             outputs=[],
-            cancels=[video_button_event],
+            cancels=[video_button_event, confirm_voices_event],
         )
 
         # Auto-match when samples are uploaded
@@ -4071,31 +4095,30 @@ def create_gui(theme, logs_in_gui=False):
             ] + [speaker_gender_info, confirm_voices_button, voice_sample_status],
         )
 
-        # Per-speaker source change: update voice dropdown choices
-        def _on_speaker_source_change(speaker_idx, uploaded_files):
+        # Pre-build voice choices for per-speaker source change (avoid importing on each change)
+        _xtts_choices_cache = [""]
+        _sample_choices_cache = [""]
+        
+        try:
+            from soni_translate.speaker_gender import get_available_voices_for_target
+            _target_lang = getattr(SoniTr, '_target_lang', 'hi')
+            _edge_voices = get_available_voices_for_target(_target_lang, engine="edge")
+            _xtts_choices_cache = [""] + _edge_voices.get("male", []) + _edge_voices.get("female", [])
+        except Exception:
+            pass
+
+        def _on_speaker_source_change(source_mode, uploaded_files):
             """When user changes source for a specific speaker, update voice dropdown."""
-            from soni_translate.speaker_gender import (
-                get_available_voices_for_target,
-            )
-            
-            target_lang = getattr(SoniTr, '_target_lang', 'hi')
-            
-            if speaker_idx is None:
-                return gr.update()
-            
-            if speaker_idx == "Audio Sample":
-                # Build sample choices
+            if source_mode == "Audio Sample":
                 if uploaded_files:
                     from soni_translate.speaker_gender import parse_uploaded_voice_samples
                     file_paths = [f if isinstance(f, str) else f.name for f in uploaded_files]
                     voice_samples, _ = parse_uploaded_voice_samples(file_paths)
                     choices = [""] + [f"{s['identity']}-{s['gender']}" for s in voice_samples]
                 else:
-                    choices = [""]
+                    choices = ["**Upload samples first**"]
             else:
-                # Build XTTS choices
-                edge_voices = get_available_voices_for_target(target_lang, engine="edge")
-                choices = [""] + edge_voices.get("male", []) + edge_voices.get("female", [])
+                choices = _xtts_choices_cache
             
             return gr.update(choices=choices, value=None)
 
