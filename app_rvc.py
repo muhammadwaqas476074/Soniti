@@ -77,10 +77,8 @@ from soni_translate.language_configuration import (
 )
 from soni_translate.utils import (
     remove_files,
-    get_hash,
     get_link_list,
     get_valid_files,
-    fix_timestamps_docs,
     run_command,
     copy_files,
 )
