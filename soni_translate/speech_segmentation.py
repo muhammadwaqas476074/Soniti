@@ -7,6 +7,7 @@ import whisperx
 import torch
 import gc
 import os
+import copy
 import soundfile as sf
 from IPython.utils import capture # noqa
 from .language_configuration import EXTRA_ALIGN, INVERTED_LANGUAGES
@@ -325,7 +326,9 @@ def align_speech(audio, result):
 
 diarization_models = {
     "pyannote_3.1": "pyannote/speaker-diarization-3.1",
+    "pyannote_3.1_precision": "pyannote/speaker-diarization-3.1",
     "pyannote_2.1": "pyannote/speaker-diarization@2.1",
+    "pyannote_silero": "pyannote/speaker-diarization-3.1",
     "disable": "",
 }
 
@@ -359,89 +362,229 @@ def diarize_speech(
     model_name="pyannote/speaker-diarization@2.1",
 ):
     """
-    Performs speaker diarization on speech segments.
+    Performs speaker diarization on speech segments with intelligent fallback.
 
-    Parameters:
-    - audio_wav (array): Audio data in WAV format to perform speaker
-        diarization.
-    - result (dict): Metadata containing information about speech segments
-        and alignments.
-    - min_speakers (int): Minimum number of speakers expected in the audio.
-    - max_speakers (int): Maximum number of speakers expected in the audio.
-    - YOUR_HF_TOKEN (str): Your Hugging Face API token for model
-        authentication.
-    - model_name (str): Name of the speaker diarization model to be used
-        (default: "pyannote/speaker-diarization@2.1").
-
-    Returns:
-    - result_diarize (dict): Updated metadata after assigning speaker
-        labels to segments.
-
-    Notes:
-    - This function utilizes a speaker diarization model to label speaker
-        segments in the audio.
-    - It assigns speakers to word-level segments based on diarization results.
-    - Cleans up memory by releasing resources after diarization.
-    - If only one speaker is specified, each segment is automatically assigned
-        as the first speaker, eliminating the need for diarization inference.
+    Strategy:
+    1. Try primary model with requested speaker range
+    2. If too few speakers found, retry with wider range
+    3. If model fails, try alternative model
+    4. Last resort: assign based on segment gaps (silence = speaker change)
     """
 
-    if max(min_speakers, max_speakers) > 1 and model_name:
-        try:
-
-            diarize_model = whisperx.DiarizationPipeline(
-                model_name=model_name,
-                use_auth_token=YOUR_HF_TOKEN,
-                device=os.environ.get("SONITR_DEVICE"),
-            )
-
-        except Exception as error:
-            error_str = str(error)
-            gc.collect()
-            torch.cuda.empty_cache()  # noqa
-            if "'NoneType' object has no attribute 'to'" in error_str:
-                if model_name == diarization_models["pyannote_2.1"]:
-                    raise ValueError(
-                        "Accept the license agreement for using Pyannote 2.1."
-                        " You need to have an account on Hugging Face and "
-                        "accept the license to use the models: "
-                        "https://huggingface.co/pyannote/speaker-diarization "
-                        "and https://huggingface.co/pyannote/segmentation "
-                        "Get your KEY TOKEN here: "
-                        "https://hf.co/settings/tokens "
-                    )
-                elif model_name == diarization_models["pyannote_3.1"]:
-                    raise ValueError(
-                        "New Licence Pyannote 3.1: You need to have an account"
-                        " on Hugging Face and accept the license to use the "
-                        "models: https://huggingface.co/pyannote/speaker-diarization-3.1 " # noqa
-                        "and https://huggingface.co/pyannote/segmentation-3.0 "
-                    )
-            else:
-                raise error
-        diarize_segments = diarize_model(
-            audio_wav, min_speakers=min_speakers, max_speakers=max_speakers
-        )
-
-        result_diarize = whisperx.assign_word_speakers(
-            diarize_segments, result
-        )
-
-        for segment in result_diarize["segments"]:
-            if "speaker" not in segment:
-                segment["speaker"] = "SPEAKER_00"
-                logger.warning(
-                    f"No speaker detected in {segment['start']}. First TTS "
-                    f"will be used for the segment text: {segment['text']} "
-                )
-
-        del diarize_model
-        gc.collect()
-        torch.cuda.empty_cache()  # noqa
-    else:
+    if max(min_speakers, max_speakers) <= 1 or not model_name:
         result_diarize = result
         result_diarize["segments"] = [
             {**item, "speaker": "SPEAKER_00"}
             for item in result_diarize["segments"]
         ]
+        return reencode_speakers(result_diarize)
+
+    # Try primary diarization
+    diarize_segments = None
+    used_model = model_name
+
+    try:
+        diarize_segments = _run_diarization(
+            audio_wav, model_name, min_speakers, max_speakers, YOUR_HF_TOKEN
+        )
+    except Exception as e:
+        logger.warning(f"Primary diarization failed ({model_name}): {e}")
+
+        # Try fallback model
+        fallback_models = [
+            m for m in [
+                "pyannote/speaker-diarization-3.1",
+                "pyannote/speaker-diarization@2.1",
+            ] if m != model_name
+        ]
+        for fallback in fallback_models:
+            try:
+                logger.info(f"Trying fallback diarization model: {fallback}")
+                diarize_segments = _run_diarization(
+                    audio_wav, fallback, min_speakers, max_speakers, YOUR_HF_TOKEN
+                )
+                used_model = fallback
+                break
+            except Exception as e2:
+                logger.warning(f"Fallback {fallback} also failed: {e2}")
+
+    if diarize_segments is None:
+        logger.warning(
+            "All diarization models failed. "
+            "Using segment-gap based speaker assignment."
+        )
+        result_diarize = _assign_speakers_by_gaps(result, min_speakers, max_speakers)
+        return reencode_speakers(result_diarize)
+
+    # Assign speakers to transcription segments
+    result_diarize = whisperx.assign_word_speakers(diarize_segments, result)
+
+    # Count unique speakers found
+    found_speakers = set()
+    for seg in result_diarize["segments"]:
+        if "speaker" in seg:
+            found_speakers.add(seg["speaker"])
+
+    segments_without_speaker = sum(
+        1 for s in result_diarize["segments"] if "speaker" not in s
+    )
+
+    logger.info(
+        f"Diarization ({used_model}): found {len(found_speakers)} speakers, "
+        f"{segments_without_speaker} segments without speaker"
+    )
+
+    # Fill missing speakers with nearest speaker based on proximity
+    if segments_without_speaker > 0:
+        result_diarize = _fill_missing_speakers(result_diarize)
+
+    # Validate: if too few speakers found but max_speakers > 1, retry
+    if len(found_speakers) < 2 and max_speakers > 1:
+        logger.warning(
+            f"Only {len(found_speakers)} speaker(s) found but "
+            f"max_speakers={max_speakers}. Retrying with wider range..."
+        )
+        try:
+            wider_segments = _run_diarization(
+                audio_wav, used_model,
+                min_speakers=2, max_speakers=max(max_speakers + 2, 6),
+                YOUR_HF_TOKEN=YOUR_HF_TOKEN,
+            )
+            wider_result = whisperx.assign_word_speakers(wider_segments, result)
+            wider_speakers = set(
+                s.get("speaker", "") for s in wider_result["segments"]
+            )
+            if len(wider_speakers) > len(found_speakers):
+                logger.info(
+                    f"Wider range found {len(wider_speakers)} speakers, "
+                    f"using better result"
+                )
+                result_diarize = wider_result
+                found_speakers = wider_speakers
+        except Exception as e:
+            logger.warning(f"Retry with wider range failed: {e}")
+
+    # Final fallback: fill any remaining missing speakers
+    for segment in result_diarize["segments"]:
+        if "speaker" not in segment:
+            segment["speaker"] = "SPEAKER_00"
+            logger.debug(
+                f"No speaker for segment at {segment.get('start', 0):.1f}s"
+            )
+
+    del diarize_segments
+    gc.collect()
+    torch.cuda.empty_cache()  # noqa
+
     return reencode_speakers(result_diarize)
+
+
+def _run_diarization(audio_wav, model_name, min_speakers, max_speakers, hf_token):
+    """Run a single diarization model and return segments."""
+    diarize_model = whisperx.DiarizationPipeline(
+        model_name=model_name,
+        use_auth_token=hf_token,
+        device=os.environ.get("SONITR_DEVICE"),
+    )
+    diarize_segments = diarize_model(
+        audio_wav, min_speakers=min_speakers, max_speakers=max_speakers
+    )
+    del diarize_model
+    gc.collect()
+    torch.cuda.empty_cache()  # noqa
+    return diarize_segments
+
+
+def _assign_speakers_by_gaps(result, min_speakers, max_speakers):
+    """
+    Assign speakers based on segment gaps (silence between segments).
+    When diarization fails completely, assume speaker changes at longer gaps.
+    """
+    segments = result.get("segments", [])
+    if not segments:
+        return result
+
+    result_copy = copy.deepcopy(result)
+
+    # Calculate typical gap between consecutive segments
+    gaps = []
+    for i in range(1, len(segments)):
+        gap = segments[i]["start"] - segments[i-1]["end"]
+        gaps.append(gap)
+
+    if not gaps:
+        for seg in result_copy["segments"]:
+            seg["speaker"] = "SPEAKER_00"
+        return result_copy
+
+    # Use median gap + 1 standard deviation as threshold for speaker change
+    import numpy as np
+    median_gap = np.median(gaps)
+    std_gap = np.std(gaps)
+    threshold = median_gap + std_gap
+
+    # Ensure threshold is reasonable (0.3s to 3.0s)
+    threshold = max(0.3, min(3.0, threshold))
+
+    logger.info(
+        f"Gap-based speaker assignment: threshold={threshold:.2f}s "
+        f"(median={median_gap:.2f}s, std={std_gap:.2f}s)"
+    )
+
+    # Assign speakers
+    current_speaker = 0
+    for i, seg in enumerate(result_copy["segments"]):
+        seg["speaker"] = f"SPEAKER_{current_speaker:02d}"
+        if i > 0:
+            gap = seg["start"] - result_copy["segments"][i-1]["end"]
+            if gap > threshold:
+                current_speaker = min(current_speaker + 1, max_speakers - 1)
+
+    found_speakers = set(s["speaker"] for s in result_copy["segments"])
+    logger.info(
+        f"Gap-based assignment: {len(found_speakers)} speakers "
+        f"(threshold: {threshold:.2f}s)"
+    )
+
+    return result_copy
+
+
+def _fill_missing_speakers(result_diarize):
+    """Fill segments without speakers by finding nearest speaker in time."""
+    segments = result_diarize["segments"]
+    missing_indices = [i for i, s in enumerate(segments) if "speaker" not in s]
+
+    if not missing_indices:
+        return result_diarize
+
+    # Build list of (time, speaker) for segments that have speakers
+    speaker_timeline = []
+    for i, seg in enumerate(segments):
+        if "speaker" in seg:
+            mid_time = (seg["start"] + seg["end"]) / 2
+            speaker_timeline.append((mid_time, seg["speaker"]))
+
+    if not speaker_timeline:
+        # No speakers at all, assign all to SPEAKER_00
+        for seg in segments:
+            seg["speaker"] = "SPEAKER_00"
+        return result_diarize
+
+    # For each missing segment, find nearest speaker
+    for idx in missing_indices:
+        seg = segments[idx]
+        seg_mid = (seg["start"] + seg["end"]) / 2
+
+        # Find nearest speaker by time
+        nearest_speaker = min(
+            speaker_timeline,
+            key=lambda x: abs(x[0] - seg_mid)
+        )[1]
+
+        seg["speaker"] = nearest_speaker
+        logger.debug(
+            f"Filled missing speaker at {seg['start']:.1f}s "
+            f"with {nearest_speaker}"
+        )
+
+    return result_diarize

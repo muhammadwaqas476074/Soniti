@@ -12,8 +12,16 @@ optimum
 sentencepiece
 srt
 git+https://github.com/R3gm/openvoice_package.git@lite
-openai==1.14.3
+openai==1.51.0
+httpx==0.27.2
 tiktoken==0.6.0
+# Audio enhancement
+demucs>=4.0.0
+pyloudnorm>=0.1.1
+pyrubberband>=0.3.0
+scipy>=1.11.0
+soundfile>=0.12.1
+librosa>=0.10.0
 # Documents
 pypdf==4.2.0
 python-docx

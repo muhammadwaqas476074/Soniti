@@ -25,6 +25,10 @@ import platform
 import logging
 import traceback
 from .logging_setup import logger
+from .speaker_gender import select_script_appropriate_voice, TARGET_VOICE_MAP
+
+MIN_TTS_CHARS = 3  # Edge TTS minimum text length
+PROSODY_TRANSFER_ENABLED = True  # Toggle prosody transfer on/off
 
 
 class TTS_OperationError(Exception):
@@ -154,12 +158,29 @@ def edge_tts_voices_list():
     return formatted_voices
 
 
-def segments_egde_tts(filtered_edge_segments, TRANSLATE_AUDIO_TO, is_gui):
+def segments_egde_tts(filtered_edge_segments, TRANSLATE_AUDIO_TO, is_gui, vocals_path=None, prosody_enabled=False):
+    FALLBACK_VOICE = "hi-IN-MadhurNeural-Male"  # guaranteed Hindi voice
+
+    # Import prosody transfer if available and enabled
+    prosody_fn = None
+    if prosody_enabled and vocals_path and os.path.exists(vocals_path):
+        try:
+            from .prosody_transfer import process_segment_with_prosody
+            prosody_fn = process_segment_with_prosody
+            logger.info("[Prosody] Prosody transfer ENABLED for Edge TTS segments")
+        except ImportError:
+            logger.warning("[Prosody] prosody_transfer module not found, skipping")
+
     for segment in tqdm(filtered_edge_segments["segments"]):
         speaker = segment["speaker"] # noqa
         text = segment["text"]
         start = segment["start"]
         tts_name = segment["tts_name"]
+
+        # Pad text that is too short for Edge TTS
+        if len(text.strip()) < MIN_TTS_CHARS:
+            logger.warning(f"Text too short for TTS ({len(text)} chars), padding: '{text}'")
+            text = text.strip() + " ।"
 
         # make the tts audio
         filename = f"audio/{start}.ogg"
@@ -167,23 +188,40 @@ def segments_egde_tts(filtered_edge_segments, TRANSLATE_AUDIO_TO, is_gui):
 
         logger.info(f"{text} >> {filename}")
         try:
+            # Extract gender from voice name (e.g. "hi-IN-MadhurNeural-Male" -> "male")
+            voice_gender = "male" if tts_name.split("-")[-1].lower() == "male" else "female"
+            
+            # PRIORITY 1: Use user-assigned voice exactly
+            # PRIORITY 2: Sanitize text to match voice script (transliterate if needed)
+            # PRIORITY 3: Emergency fallback to multilingual voice (same gender)
+            from .speaker_gender import sanitize_text_for_voice, get_emergency_fallback_voice
+            
+            sanitized_text, final_voice, was_modified = sanitize_text_for_voice(text, tts_name)
+            
+            # If sanitization failed or text still doesn't match, try emergency fallback
+            if sanitized_text != text and not was_modified:
+                # Text has script mismatch but sanitization didn't help
+                final_voice = get_emergency_fallback_voice(tts_name, voice_gender)
+                sanitized_text = text  # Try original text with multilingual voice
+                logger.warning(f"[TTS] Emergency fallback: {tts_name} → {final_voice}")
+            
+            voice_id = "-".join(final_voice.split("-")[:-1])
+            
+            if was_modified:
+                logger.info(f"[TTS] Using sanitized text for {speaker}: '{sanitized_text[:50]}...'")
+
             if is_gui:
                 asyncio.run(
-                    edge_tts.Communicate(
-                        text, "-".join(tts_name.split("-")[:-1])
-                    ).save(temp_file)
+                    edge_tts.Communicate(sanitized_text, voice_id).save(temp_file)
                 )
             else:
-                # nest_asyncio.apply() if not is_gui else None
-                command = f'edge-tts -t "{text}" -v "{tts_name.replace("-Male", "").replace("-Female", "")}" --write-media "{temp_file}"'
+                command = f'edge-tts -t "{sanitized_text}" -v "{voice_id}" --write-media "{temp_file}"'
                 run_command(command)
             verify_saved_file_and_size(temp_file)
 
             data, sample_rate = sf.read(temp_file)
             data = pad_array(data, sample_rate)
-            # os.remove(temp_file)
 
-            # Save file
             write_chunked(
                 file=filename,
                 samplerate=sample_rate,
@@ -193,8 +231,53 @@ def segments_egde_tts(filtered_edge_segments, TRANSLATE_AUDIO_TO, is_gui):
             )
             verify_saved_file_and_size(filename)
 
+            # Apply prosody transfer if enabled
+            if prosody_fn:
+                try:
+                    adapted_path = filename.replace(".ogg", "_prosody.ogg")
+                    prosody_fn(
+                        tts_audio_path=filename,
+                        original_vocals_path=vocals_path,
+                        segment_start=float(start),
+                        segment_end=float(segment.get("end", start)),
+                        output_path=adapted_path,
+                    )
+                    if os.path.exists(adapted_path) and os.path.getsize(adapted_path) > 0:
+                        os.replace(adapted_path, filename)
+                        logger.debug(f"[Prosody] Applied to {filename}")
+                except Exception as p_err:
+                    logger.warning(f"[Prosody] Transfer failed for {filename}: {p_err}")
+
         except Exception as error:
-            error_handling_in_tts(error, segment, TRANSLATE_AUDIO_TO, filename)
+            logger.error(f"Error with voice {tts_name}: {error}")
+
+            # Retry once with guaranteed Hindi voice
+            try:
+                logger.warning(f"Retrying with fallback voice: {FALLBACK_VOICE}")
+                fb_voice_id = FALLBACK_VOICE.replace("-Male", "").replace("-Female", "")
+                if is_gui:
+                    asyncio.run(
+                        edge_tts.Communicate(text, fb_voice_id).save(temp_file)
+                    )
+                else:
+                    command = f'edge-tts -t "{text}" -v "{fb_voice_id}" --write-media "{temp_file}"'
+                    run_command(command)
+                verify_saved_file_and_size(temp_file)
+
+                data, sample_rate = sf.read(temp_file)
+                data = pad_array(data, sample_rate)
+                write_chunked(
+                    file=filename,
+                    samplerate=sample_rate,
+                    data=data,
+                    format="ogg",
+                    subtype="vorbis",
+                )
+                verify_saved_file_and_size(filename)
+
+            except Exception as retry_error:
+                logger.error(f"Fallback also failed: {retry_error}")
+                error_handling_in_tts(error, segment, TRANSLATE_AUDIO_TO, filename)
 
 
 # =====================================
@@ -986,6 +1069,8 @@ def audio_segmentation_to_voice(
     model_id_bark="suno/bark-small",
     model_id_coqui="tts_models/multilingual/multi-dataset/xtts_v2",
     delete_previous_automatic=True,
+    vocals_path=None,
+    prosody_enabled=False,
 ):
 
     remove_directory_contents("audio")
@@ -1049,7 +1134,7 @@ def audio_segmentation_to_voice(
     # Infer
     if filtered_edge["segments"]:
         logger.info(f"EDGE TTS: {speakers_edge}")
-        segments_egde_tts(filtered_edge, TRANSLATE_AUDIO_TO, is_gui)  # mp3
+        segments_egde_tts(filtered_edge, TRANSLATE_AUDIO_TO, is_gui, vocals_path=vocals_path, prosody_enabled=prosody_enabled)  # mp3
     if filtered_bark["segments"]:
         logger.info(f"BARK TTS: {speakers_bark}")
         segments_bark_tts(

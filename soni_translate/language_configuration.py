@@ -55,6 +55,7 @@ LANGUAGES = {
     "Urdu (ur)": "ur",
     "Vietnamese (vi)": "vi",
     "Hindi (hi)": "hi",
+    "Hindistani (hi-ur)": "hi-ur",
     "Indonesian (id)": "id",
     "Bengali (bn)": "bn",
     "Telugu (te)": "te",
@@ -189,7 +190,10 @@ EXTRA_ALIGN = {
 def fix_code_language(translate_to, syntax="google"):
     if syntax == "google":
         # google-translator, gTTS
-        replace_lang_code = {"zh": "zh-CN", "he": "iw", "zh-cn": "zh-CN"}
+        replace_lang_code = {
+            "zh": "zh-CN", "he": "iw", "zh-cn": "zh-CN",
+            "hi-ur": "hi",
+        }
     elif syntax == "coqui":
         # coqui-xtts
         replace_lang_code = {"zh": "zh-cn", "zh-CN": "zh-cn", "zh-TW": "zh-cn"}
@@ -532,6 +536,7 @@ LANGUAGE_CODE_IN_THREE_LETTERS = {
     "ur": "urd",
     "vi": "vie",
     "hi": "hin",
+    "hi-ur": "hin",
     "id": "ind",
     "bn": "ben",
     "te": "tel",

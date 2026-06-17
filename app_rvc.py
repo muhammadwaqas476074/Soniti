@@ -1,4 +1,5 @@
 import gradio as gr
+from tqdm import tqdm
 from soni_translate.logging_setup import (
     logger,
     set_logging_level,
@@ -7,6 +8,7 @@ from soni_translate.logging_setup import (
 import whisperx
 import torch
 import os
+import threading
 from soni_translate.audio_segments import create_translated_audio
 from soni_translate.text_to_speech import (
     audio_segmentation_to_voice,
@@ -20,6 +22,38 @@ from soni_translate.translate_segments import (
     translate_text,
     TRANSLATION_PROCESS_OPTIONS,
     DOCS_TRANSLATION_PROCESS_OPTIONS
+)
+from soni_translate.speaker_gender import (
+    detect_speakers_gender,
+    auto_assign_voices,
+    get_voice_sample_files,
+    TARGET_VOICE_MAP,
+)
+from soni_translate.audio_separation import (
+    separate_audio_sources,
+    remix_dubbed_audio,
+)
+from soni_translate.speaker_voices import (
+    extract_speaker_samples,
+    get_speaker_reference,
+    apply_tone_color,
+)
+from soni_translate.audio_enhancement import (
+    normalize_segment_loudness,
+    extract_room_sample,
+    apply_room_tone,
+)
+from soni_translate.timing_sync import (
+    fit_audio_to_duration,
+    check_and_split_segment,
+    verify_alignment,
+)
+from soni_translate.preview_retry import (
+    filter_segments_preview,
+    save_segment_manifest,
+    load_segment_manifest,
+    retry_segment,
+    assemble_from_manifest,
 )
 from soni_translate.preprocessor import (
     audio_video_preprocessor,
@@ -43,17 +77,33 @@ from soni_translate.language_configuration import (
 )
 from soni_translate.utils import (
     remove_files,
-    download_list,
-    upload_model_list,
-    download_manager,
-    run_command,
-    is_audio_file,
-    is_subtitle_file,
-    copy_files,
-    get_valid_files,
+    get_hash,
     get_link_list,
-    remove_directory_contents,
+    get_valid_files,
+    fix_timestamps_docs,
+    run_command,
+    copy_files,
 )
+
+import shutil
+
+# ---- Google Drive copy helper ----
+def copy_to_drive(src_path, drive_folder="/content/drive/MyDrive/SoniTranslate"):
+    """Copy output file to Google Drive if mounted."""
+    if not src_path or not os.path.exists(src_path):
+        return False
+    if not os.path.exists("/content/drive"):
+        return False
+    try:
+        os.makedirs(drive_folder, exist_ok=True)
+        dst = os.path.join(drive_folder, os.path.basename(src_path))
+        shutil.copy2(src_path, dst)
+        logger.info(f"Copied to Drive: {dst}")
+        return True
+    except Exception as e:
+        logger.debug(f"Drive copy failed: {e}")
+        return False
+
 from soni_translate.mdx_net import (
     UVR_MODELS,
     MDX_DOWNLOAD_LINK,
@@ -140,6 +190,152 @@ class TTS_Info:
         return list_tts
 
 
+class PipelineProgress:
+    """Multi-step progress tracker with per-step ETA and real progress bars."""
+
+    STEPS = [
+        ("preprocess",   "Preprocessing media",         0.00, 0.10),
+        ("demucs",       "Separating vocals/BGM",       0.10, 0.20),
+        ("transcribe",   "Transcribing speech",         0.20, 0.35),
+        ("align",        "Aligning transcript",         0.35, 0.45),
+        ("diarize",      "Diarizing speakers",          0.45, 0.58),
+        ("gender",       "Detecting speaker genders",   0.58, 0.63),
+        ("voice_clone",  "Extracting speaker samples",  0.63, 0.67),
+        ("translate",    "Translating text",            0.67, 0.73),
+        ("tts",          "Generating speech (TTS)",      0.73, 0.83),
+        ("prosody",      "Adapting prosody",            0.83, 0.86),
+        ("voice_imit",   "Voice imitation",             0.86, 0.89),
+        ("custom_voices","Applying custom voices",      0.89, 0.91),
+        ("sync",         "Sync alignment",              0.91, 0.93),
+        ("enhance",      "Enhancing audio quality",     0.93, 0.95),
+        ("timing",       "Adjusting timing",            0.95, 0.97),
+        ("output",       "Creating final output",       0.97, 1.00),
+    ]
+
+    def __init__(self, is_gui=False, progress=None):
+        self.is_gui = is_gui
+        self.progress = progress
+        self.step_start = {}
+        self.step_end = {}
+        self.current_step = None
+        self.start_time = time.time()
+        self.tqdm_bar = None
+
+    def _get_step_range(self, step_id):
+        for s in self.STEPS:
+            if s[0] == step_id:
+                return s[2], s[3]
+        return 0.0, 1.0
+
+    def _get_step_label(self, step_id):
+        for s in self.STEPS:
+            if s[0] == step_id:
+                return s[1]
+        return step_id
+
+    def _format_time(self, seconds):
+        if seconds < 0 or seconds > 7200:
+            return "??:??"
+        m, s = divmod(int(seconds), 60)
+        return f"{m}m {0:02d}s".format(m, s) if m > 0 else f"{s}s"
+
+    def _elapsed(self):
+        return time.time() - self.start_time
+
+    def _get_eta_for_step(self, step_id):
+        """Estimate remaining time for current step using historical data."""
+        start_pct, end_pct = self._get_step_range(step_id)
+        step_range = end_pct - start_pct
+        elapsed_in_step = time.time() - self.step_start.get(step_id, time.time())
+
+        # Estimate total step duration from completed steps
+        total_estimated = elapsed_in_step  # default: just use elapsed
+
+        # If we have previous step durations, use weighted average
+        if len(self.step_end) >= 2:
+            completed_durations = []
+            for sid, send in self.step_end.items():
+                sstart = self.step_start.get(sid, send)
+                s_range = self._get_step_range(sid)
+                duration_per_pct = (send - sstart) / max(s_range[1] - s_range[0], 0.001)
+                completed_durations.append(duration_per_pct)
+
+            if completed_durations:
+                avg_rate = sum(completed_durations) / len(completed_durations)
+                total_estimated = avg_rate * step_range
+
+        remaining = max(0, total_estimated - elapsed_in_step)
+        return remaining, elapsed_in_step
+
+    def step(self, step_id, msg=None):
+        """Start a new progress step with tqdm progress bar."""
+        self.current_step = step_id
+        start_pct, end_pct = self._get_step_range(step_id)
+        label = msg or self._get_step_label(step_id)
+        self.step_start[step_id] = time.time()
+
+        # Close previous tqdm bar if any
+        if self.tqdm_bar is not None:
+            self.tqdm_bar.close()
+            self.tqdm_bar = None
+
+        # Create tqdm progress bar for this step
+        self.tqdm_bar = tqdm(
+            total=100,
+            desc=f"  {label}",
+            bar_format="{desc}: {percentage:5.1f}%|{bar}| {elapsed}<{remaining}",
+            leave=True,
+        )
+
+        # Also log and update Gradio
+        elapsed = self._elapsed()
+        display_msg = f"[{label}]"
+        logger.info(display_msg)
+        if self.is_gui and self.progress:
+            self.progress(start_pct, desc=display_msg)
+
+    def update(self, step_id, pct):
+        """Update progress within current step (0.0 to 1.0 within step)."""
+        if self.tqdm_bar:
+            self.tqdm_bar.n = int(pct * 100)
+            self.tqdm_bar.refresh()
+
+    def done(self, step_id):
+        """Mark step as complete."""
+        self.step_end[step_id] = time.time()
+        _, end_pct = self._get_step_range(step_id)
+        elapsed_step = self.step_end[step_id] - self.step_start.get(step_id, self.step_end[step_id])
+
+        label = self._get_step_label(step_id)
+
+        # Finalize tqdm bar
+        if self.tqdm_bar:
+            self.tqdm_bar.n = 100
+            self.tqdm_bar.set_description_str(f"  {label} done")
+            self.tqdm_bar.close()
+            self.tqdm_bar = None
+
+        # Estimate remaining pipeline time
+        remaining_steps = [s for s in self.STEPS if s[0] > step_id]
+        if remaining_steps and len(self.step_end) >= 2:
+            # Use average rate per progress point from completed steps
+            completed = []
+            for sid, send in self.step_end.items():
+                sstart = self.step_start.get(sid, send)
+                sr = self._get_step_range(sid)
+                completed.append((send - sstart) / max(sr[1] - sr[0], 0.001))
+            avg_rate = sum(completed) / len(completed)
+            pipeline_remaining = avg_rate * (1.0 - end_pct)
+            eta_str = f" ~{self._format_time(pipeline_remaining)} remaining"
+        else:
+            eta_str = ""
+
+        display_msg = f"[{label} done in {self._format_time(elapsed_step)}]{eta_str}"
+        logger.info(display_msg)
+        if self.is_gui and self.progress:
+            self.progress(end_pct, desc=display_msg)
+
+
 def prog_disp(msg, percent, is_gui, progress=None):
     logger.info(msg)
     if is_gui:
@@ -152,6 +348,71 @@ def warn_disp(wrn_lang, is_gui):
         gr.Warning(wrn_lang)
 
 
+class PipelinePausedForReview(Exception):
+    """Raised when pipeline pauses for user to review voice assignments."""
+    pass
+
+
+class PipelineCancelled(Exception):
+    """Raised when pipeline is cancelled by user."""
+    pass
+
+
+# =====================================
+# Pipeline State Checkpoint
+# =====================================
+_PIPELINE_CHECKPOINT_DIR = "pipeline_checkpoints"
+
+
+def _save_pipeline_checkpoint(media_hash, **state):
+    """Save pipeline state to disk. Accepts named kwargs like result_diarize, etc."""
+    try:
+        os.makedirs(_PIPELINE_CHECKPOINT_DIR, exist_ok=True)
+        path = os.path.join(_PIPELINE_CHECKPOINT_DIR, f"{media_hash}.json")
+        # Only save JSON-serializable data
+        serializable = {}
+        for k, v in state.items():
+            try:
+                json.dumps(v, ensure_ascii=False)
+                serializable[k] = v
+            except (TypeError, ValueError):
+                pass  # skip non-serializable objects
+        serializable["_checkpoint"] = True
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(serializable, f, ensure_ascii=False)
+        logger.debug(f"Pipeline checkpoint saved: {list(serializable.keys())}")
+    except Exception as e:
+        logger.debug(f"Could not save pipeline checkpoint: {e}")
+
+
+def _load_pipeline_checkpoint(media_hash):
+    """Load pipeline state from disk. Returns dict or empty dict."""
+    try:
+        path = os.path.join(_PIPELINE_CHECKPOINT_DIR, f"{media_hash}.json")
+        if not os.path.exists(path):
+            return {}
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("_checkpoint"):
+            logger.info(f"Loaded pipeline checkpoint: {list(data.keys())}")
+            return data
+        return {}
+    except Exception as e:
+        logger.debug(f"Could not load pipeline checkpoint: {e}")
+        return {}
+
+
+def _clear_pipeline_checkpoint(media_hash):
+    """Clear pipeline checkpoint after successful completion."""
+    try:
+        path = os.path.join(_PIPELINE_CHECKPOINT_DIR, f"{media_hash}.json")
+        if os.path.exists(path):
+            os.remove(path)
+            logger.debug("Pipeline checkpoint cleared")
+    except Exception:
+        pass
+
+
 class SoniTrCache:
     def __init__(self):
         self.cache = {
@@ -160,6 +421,7 @@ class SoniTrCache:
             'transcript_align': [],
             'break_align': [],
             'diarize': [],
+            'gender_detect': [],
             'translate': [],
             'subs_and_edit': [],
             'tts': [],
@@ -174,6 +436,7 @@ class SoniTrCache:
             'transcript_align': [],
             'break_align': [],
             'diarize': [],
+            'gender_detect': [],
             'translate': [],
             'subs_and_edit': [],
             'tts': [],
@@ -249,6 +512,122 @@ class SoniTrCache:
             logger.info("Cache flushed")
 
 
+def _enhance_dubbed_audio(
+    result_diarize, dub_audio_file, output_file,
+    use_loudness, use_room_tone, room_sample_path, audio_dir="audio"
+):
+    """Enhance dubbed audio with loudness normalization and room tone."""
+    import glob
+    import shutil
+
+    segments = result_diarize.get("segments", [])
+    if not segments:
+        return dub_audio_file
+
+    # For each TTS segment, apply enhancement
+    tts_files = sorted(glob.glob(os.path.join(audio_dir, "*.ogg")))
+    if not tts_files:
+        tts_files = sorted(glob.glob(os.path.join(audio_dir, "*.wav")))
+
+    for tts_file in tts_files:
+        if "_speaker_" in os.path.basename(tts_file):
+            continue  # Skip speaker reference files
+
+        enhanced_file = tts_file.replace(".ogg", "_enhanced.wav").replace(
+            ".wav", "_enhanced.wav"
+        )
+
+        try:
+            # Find corresponding original segment
+            basename = os.path.basename(tts_file).split(".")[0]
+            try:
+                seg_start = float(basename)
+            except ValueError:
+                continue
+
+            # Find original segment audio
+            orig_seg_file = os.path.join(audio_dir, f"_orig_{basename}.wav")
+
+            if use_loudness and os.path.exists(orig_seg_file):
+                normalize_segment_loudness(
+                    orig_seg_file, tts_file, enhanced_file
+                )
+                if use_room_tone and room_sample_path:
+                    final_file = enhanced_file.replace(
+                        "_enhanced.wav", "_final.wav"
+                    )
+                    apply_room_tone(
+                        enhanced_file, room_sample_path, final_file
+                    )
+            elif use_room_tone and room_sample_path:
+                final_file = enhanced_file.replace(
+                    "_enhanced.wav", "_final.wav"
+                )
+                apply_room_tone(
+                    tts_file, room_sample_path, final_file
+                )
+        except Exception as e:
+            logger.debug(f"Enhancement skip for {tts_file}: {e}")
+
+    return dub_audio_file
+
+
+def _apply_timing_fixes(result_diarize, audio_dir="audio"):
+    """Apply time-stretching to TTS segments to fit their duration slots."""
+    import glob
+
+    segments = result_diarize.get("segments", [])
+    tts_files = sorted(glob.glob(os.path.join(audio_dir, "*.ogg")))
+    if not tts_files:
+        tts_files = sorted(glob.glob(os.path.join(audio_dir, "*.wav")))
+
+    tts_files = [f for f in tts_files if "_speaker_" not in os.path.basename(f)]
+
+    for tts_file in tts_files:
+        try:
+            basename = os.path.basename(tts_file).split(".")[0]
+            seg_start = float(basename)
+
+            # Find matching segment
+            seg = None
+            for s in segments:
+                if abs(float(s.get("start", 0)) - seg_start) < 0.1:
+                    seg = s
+                    break
+
+            if seg:
+                duration = float(seg.get("end", 0)) - float(seg.get("start", 0))
+                if duration > 0:
+                    fit_file = tts_file.replace(".ogg", "_fit.wav").replace(
+                        ".wav", "_fit.wav"
+                    )
+                    fit_audio_to_duration(tts_file, duration, fit_file)
+        except Exception as e:
+            logger.debug(f"Timing fix skip: {e}")
+
+
+def _build_segment_manifest(result_diarize, audio_files):
+    """Build segment manifest data for retry functionality."""
+    segments = result_diarize.get("segments", [])
+    manifest = []
+
+    for i, seg in enumerate(segments):
+        tts_path = audio_files[i] if i < len(audio_files) else None
+        manifest.append({
+            "index": i,
+            "speaker": seg.get("speaker", "SPEAKER_00"),
+            "start": seg.get("start", 0),
+            "end": seg.get("end", 0),
+            "original_text": seg.get("text", ""),
+            "translated_text": seg.get("text", ""),
+            "tts_audio_path": tts_path,
+            "status": "ok" if tts_path else "missing",
+            "target_lang": result_diarize.get("language", ""),
+        })
+
+    return manifest
+
+
 def get_hash(filepath):
     with open(filepath, 'rb') as f:
         file_hash = hashlib.blake2b()
@@ -285,6 +664,16 @@ class SoniTranslate(SoniTrCache):
         self.edit_subs_complete = False
         self.voiceless_id = None
         self.burn_subs_id = None
+        self.speaker_info = {}
+        self.auto_voice_assignments = {}
+        self._stop_before_tts = False
+        self._paused_args = None
+        self._paused_kwargs = None
+        self._cancel_event = threading.Event()
+        self._cancel_lock = threading.Lock()
+        self._upload_cancel_event = threading.Event()
+        self._upload_args_queue = None  # stored args when translate clicked during upload
+        self._uploading = False
 
         self.vci = ClassVoices(only_cpu=cpu_mode)
 
@@ -324,7 +713,65 @@ class SoniTranslate(SoniTrCache):
 
         return self.tts_info.tts_list()
 
+    # ---- Cancellation ----
+    def cancel_pipeline(self):
+        """Signal the pipeline to stop at next checkpoint."""
+        with self._cancel_lock:
+            self._cancel_event.set()
+        # Also signal translation loop to stop
+        from soni_translate.translate_segments import set_translation_cancel
+        set_translation_cancel()
+        # Cancel running pipeline future
+        if self._pipeline_future and not self._pipeline_future.done():
+            self._pipeline_future.cancel()
+        logger.info("Pipeline cancel requested")
+
+    def reset_cancel(self):
+        """Clear the cancel signal for next run."""
+        with self._cancel_lock:
+            self._cancel_event.clear()
+        from soni_translate.translate_segments import clear_translation_cancel
+        clear_translation_cancel()
+        # Don't cancel future here - it's cancelled by cancel_pipeline
+
+    def _check_cancelled(self, step_name=""):
+        """Raise if cancel was requested. Call this at pipeline checkpoints."""
+        if self._cancel_event.is_set():
+            with self._cancel_lock:
+                self._cancel_event.clear()
+            raise PipelineCancelled(f"Cancelled during {step_name}")
+
+    # ---- Upload queue & cancel ----
+    def queue_translate(self, *args):
+        """Store translate args when button clicked during upload."""
+        self._upload_args_queue = args
+        logger.info("Translate queued — will start when upload completes")
+
+    def run_queued_translate(self):
+        """Run the queued translate if any. Called after upload completes."""
+        if self._upload_args_queue is not None:
+            args = self._upload_args_queue
+            self._upload_args_queue = None
+            logger.info("Running queued translate")
+            try:
+                return self.run_until_gender_detection(*args)
+            except Exception as e:
+                logger.error(f"Queued translate failed: {e}")
+                return [f"Error: {e}"]
+        return None
+
+    def cancel_upload(self):
+        """Signal to abort current upload."""
+        self._upload_cancel_event.set()
+        logger.info("Upload cancel requested")
+
+    def reset_upload_cancel(self):
+        """Clear upload cancel signal."""
+        self._upload_cancel_event.clear()
+
     def batch_multilingual_media_conversion(self, *kwargs):
+        # Early cancellation check
+        self._check_cancelled("start")
         # logger.debug(str(kwargs))
 
         media_file_arg = kwargs[0] if kwargs[0] is not None else []
@@ -337,12 +784,22 @@ class SoniTranslate(SoniTrCache):
         path_arg = [x.strip() for x in path_arg.split(',')]
         path_arg = get_valid_files(path_arg)
 
-        edit_text_arg = kwargs[31]
-        get_text_arg = kwargs[32]
+        edit_text_arg = kwargs[32]
+        get_text_arg = kwargs[33]
 
+        # Extract new audio enhancement parameters
+        use_demucs = kwargs[-10] if len(kwargs) > 10 else False
+        use_per_speaker = kwargs[-9] if len(kwargs) > 9 else False
+        use_loudness = kwargs[-8] if len(kwargs) > 8 else False
+        use_room_tone = kwargs[-7] if len(kwargs) > 7 else False
+        use_sync = kwargs[-6] if len(kwargs) > 6 else False
+        use_prosody = kwargs[-5] if len(kwargs) > 5 else False
+        preview_mode = kwargs[-4] if len(kwargs) > 4 else False
+        preview_duration = kwargs[-3] if len(kwargs) > 3 else 60.0
+        preview_start = kwargs[-2] if len(kwargs) > 2 else 0
         is_gui_arg = kwargs[-1]
 
-        kwargs = kwargs[3:]
+        kwargs = kwargs[3:-10]  # remove extracted audio enhancement params
 
         media_batch = media_file_arg + link_media_arg + path_arg
         media_batch = list(filter(lambda x: x != "", media_batch))
@@ -363,7 +820,16 @@ class SoniTranslate(SoniTrCache):
         for media in media_batch:
             # Call the nested function with the parameters
             output_file = self.multilingual_media_conversion(
-                media, "", "", *kwargs
+                media, "", "", *kwargs,
+                use_demucs_separation=use_demucs,
+                use_per_speaker_cloning=use_per_speaker,
+                use_loudness_normalization=use_loudness,
+                use_room_tone=use_room_tone,
+                use_sync_alignment=use_sync,
+                use_prosody_transfer=use_prosody,
+                preview_mode=preview_mode,
+                preview_duration=preview_duration,
+                preview_start=preview_start,
             )
 
             if isinstance(output_file, str):
@@ -374,6 +840,148 @@ class SoniTranslate(SoniTrCache):
                 gr.Info(f"Done: {os.path.basename(output_file[0])}")
 
         return result
+
+    def run_until_gender_detection(self, *args, **kwargs):
+        """
+        Runs pipeline up to and including gender detection.
+        Stores state, returns without doing TTS.
+        Called by the main Translate button.
+        """
+        self.reset_cancel()
+        self._stop_before_tts = True
+        self._paused_args = args
+        self._paused_kwargs = kwargs
+        try:
+            result = self.batch_multilingual_media_conversion(*args, **kwargs)
+            return result
+        except PipelinePausedForReview:
+            # Create placeholder file so gr.File output works
+            placeholder = "outputs/paused_review.txt"
+            os.makedirs("outputs", exist_ok=True)
+            with open(placeholder, "w") as f:
+                f.write(
+                    "Pipeline paused for voice review.\n"
+                    "Review speaker assignments above, then click Confirm.\n"
+                )
+            return [placeholder]
+        except PipelineCancelled:
+            logger.info("Pipeline cancelled by user during translation phase")
+            placeholder = "outputs/cancelled.txt"
+            os.makedirs("outputs", exist_ok=True)
+            with open(placeholder, "w") as f:
+                f.write("Pipeline cancelled. You can change settings and start again.\n")
+            return [placeholder]
+        finally:
+            self._stop_before_tts = False
+
+    def run_from_tts(self):
+        """Continue pipeline from TTS step using confirmed voice assignments."""
+        self.reset_cancel()
+        self._stop_before_tts = False
+        if not hasattr(self, '_paused_args') or not self._paused_args:
+            placeholder = "outputs/no_output.txt"
+            os.makedirs("outputs", exist_ok=True)
+            with open(placeholder, "w") as f:
+                f.write("No paused pipeline found. Run translation again.\n")
+            return [placeholder]
+
+        # Check if we have the required pre-TTS data
+        has_segments = (
+            hasattr(self, 'result_diarize')
+            and self.result_diarize
+            and self.result_diarize.get("segments")
+        )
+
+        if has_segments:
+            # Already have translated segments — skip to TTS directly
+            logger.info(
+                "Resuming from TTS — skipping already-completed steps "
+                f"({len(self.result_diarize['segments'])} segments ready)"
+            )
+            try:
+                result = self.batch_multilingual_media_conversion(
+                    *self._paused_args, **self._paused_kwargs
+                )
+                return result
+            except PipelineCancelled:
+                logger.info("Pipeline cancelled by user during TTS phase")
+                placeholder = "outputs/cancelled.txt"
+                os.makedirs("outputs", exist_ok=True)
+                with open(placeholder, "w") as f:
+                    f.write(
+                        "TTS cancelled. Translation progress preserved.\n"
+                        "You can change voice samples and click Confirm again.\n"
+                    )
+                return [placeholder]
+            except Exception as e:
+                logger.error(f"Pipeline continuation failed: {e}")
+                placeholder = "outputs/error.txt"
+                os.makedirs("outputs", exist_ok=True)
+                with open(placeholder, "w") as f:
+                    f.write(f"Error: {e}\n")
+                return [placeholder]
+        else:
+            # Missing data — must re-run full pipeline
+            logger.warning(
+                "Pre-TTS data missing, re-running full pipeline"
+            )
+            try:
+                result = self.batch_multilingual_media_conversion(
+                    *self._paused_args, **self._paused_kwargs
+                )
+                return result
+            except PipelinePausedForReview:
+                placeholder = "outputs/paused_review.txt"
+                os.makedirs("outputs", exist_ok=True)
+                with open(placeholder, "w") as f:
+                    f.write("Pipeline paused for voice review.\n")
+                return [placeholder]
+            except PipelineCancelled:
+                logger.info("Pipeline cancelled by user")
+                placeholder = "outputs/cancelled.txt"
+                os.makedirs("outputs", exist_ok=True)
+                with open(placeholder, "w") as f:
+                    f.write("Pipeline cancelled. You can change settings and start again.\n")
+                return [placeholder]
+            except Exception as e:
+                logger.error(f"Pipeline continuation failed: {e}")
+                placeholder = "outputs/error.txt"
+                os.makedirs("outputs", exist_ok=True)
+                with open(placeholder, "w") as f:
+                    f.write(f"Error: {e}\n")
+                return [placeholder]
+
+    def _clip_media_for_preview(self, audio_path, video_path, start_sec, duration_sec):
+        """Clip media to a specific time range for preview mode."""
+        import subprocess
+        output_dir = "preview_clip"
+        os.makedirs(output_dir, exist_ok=True)
+        clipped = None
+
+        if video_path and os.path.exists(video_path):
+            ext = os.path.splitext(video_path)[1]
+            clipped_video = os.path.join(output_dir, f"preview{ext}")
+            cmd = (
+                f'ffmpeg -y -ss {start_sec} -i "{video_path}" '
+                f'-t {duration_sec} -c copy "{clipped_video}"'
+            )
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if result.returncode == 0 and os.path.exists(clipped_video):
+                clipped = clipped_video
+                logger.info(f"Preview: clipped video {start_sec}s-{start_sec + duration_sec}s")
+
+        elif audio_path and os.path.exists(audio_path):
+            clipped_audio = os.path.join(output_dir, "preview.wav")
+            cmd = (
+                f'ffmpeg -y -ss {start_sec} -i "{audio_path}" '
+                f'-t {duration_sec} -ar 16000 -ac 1 "{clipped_audio}"'
+            )
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            if result.returncode == 0 and os.path.exists(clipped_audio):
+                clipped = clipped_audio
+                logger.info(f"Preview: clipped audio {start_sec}s-{start_sec + duration_sec}s")
+
+        return clipped
 
     def multilingual_media_conversion(
         self,
@@ -417,6 +1025,7 @@ class SoniTranslate(SoniTrCache):
         segment_duration_limit=15,
         diarization_model="pyannote_2.1",
         translate_process="google_translator_batch",
+        openrouter_batch_size=20,
         subtitle_file=None,
         output_type="video (mp4)",
         voiceless_track=False,
@@ -433,6 +1042,16 @@ class SoniTranslate(SoniTrCache):
         enable_cache=True,
         custom_voices=False,
         custom_voices_workers=1,
+        use_demucs_separation=False,
+        use_per_speaker_cloning=False,
+        use_loudness_normalization=False,
+        use_room_tone=False,
+        use_sync_alignment=False,
+        use_prosody_transfer=False,
+        preview_mode=False,
+        preview_duration=60.0,
+        preview_start=0,
+        retry_segment_index=-1,
         is_gui=False,
         progress=gr.Progress(),
     ):
@@ -452,6 +1071,15 @@ class SoniTranslate(SoniTrCache):
             or "OpenAI-TTS" in tts_voice00
         ):
             check_openai_api_key()
+
+        if "openrouter" in translate_process:
+            if not os.environ.get("OPENROUTER_API_KEY"):
+                raise ValueError(
+                    "To use OpenRouter translation, please set the "
+                    "OPENROUTER_API_KEY environment variable.\n"
+                    "Linux: export OPENROUTER_API_KEY='your-key'\n"
+                    "Or change the translation process in Advanced settings."
+                )
 
         if media_file is None:
             media_file = (
@@ -496,6 +1124,9 @@ class SoniTranslate(SoniTrCache):
 
         TRANSLATE_AUDIO_TO = LANGUAGES[target_language]
         SOURCE_LANGUAGE = LANGUAGES[origin_language]
+        
+        # Store target language for speaker voice assignment
+        SoniTr._target_lang = TRANSLATE_AUDIO_TO
 
         if (
             transcriber_model == "OpenAI_API_Whisper"
@@ -604,32 +1235,77 @@ class SoniTranslate(SoniTrCache):
             media_base_hash = media_file
         self.clear_cache(media_base_hash, force=(not enable_cache))
 
+        # Try to restore from pipeline checkpoint
+        checkpoint = _load_pipeline_checkpoint(media_base_hash)
+        checkpoint_has_translated = bool(
+            checkpoint
+            and checkpoint.get("result_diarize")
+            and checkpoint["result_diarize"].get("segments")
+            and any(
+                s.get("text", "") != ""
+                for s in checkpoint["result_diarize"]["segments"]
+            )
+        )
+
         if not get_video_from_text_json:
             self.result_diarize = (
                 self.align_language
             ) = self.result_source_lang = None
+            # Initialize progress tracker
+            pr = PipelineProgress(is_gui=is_gui, progress=progress)
+
+            # Restore from checkpoint if available — skip completed steps
+            if checkpoint_has_translated:
+                self.result_diarize = checkpoint["result_diarize"]
+                self.auto_voice_assignments = checkpoint.get("auto_voice_assignments", {})
+                self.speaker_info = checkpoint.get("speaker_info", {})
+                self.result_source_lang = copy.deepcopy(self.result_diarize)
+                logger.info(
+                    f"Restored from checkpoint: "
+                    f"{len(self.result_diarize['segments'])} segments with translations"
+                )
+
             if not self.task_in_cache("media", [media_base_hash, preview], {}):
                 if is_audio_file(media_file):
-                    prog_disp(
-                        "Processing audio...", 0.15, is_gui, progress=progress
-                    )
+                    pr.step("preprocess", "Processing audio...")
                     audio_preprocessor(preview, media_file, base_audio_wav)
                 else:
-                    prog_disp(
-                        "Processing video...", 0.15, is_gui, progress=progress
-                    )
+                    pr.step("preprocess", "Processing video...")
                     audio_video_preprocessor(
                         preview, media_file, base_video_file, base_audio_wav
                     )
                 logger.debug("Set file complete.")
+                pr.done("preprocess")
+                self._check_cancelled("preprocess")
+
+            # Demucs source separation (vocals from background)
+            self.vocals_path = None
+            self.no_vocals_path = None
+            if use_demucs_separation and os.path.exists(base_audio_wav):
+                pr.step("demucs", "Separating vocals from background music...")
+                try:
+                    self.vocals_path, self.no_vocals_path = (
+                        separate_audio_sources(
+                            base_audio_wav,
+                            output_dir="audio_separated",
+                        )
+                    )
+                    # Use separated vocals for ASR/diarization
+                    if self.vocals_path and os.path.exists(self.vocals_path):
+                        base_audio_wav = self.vocals_path
+                        logger.info(
+                            "Using Demucs-separated vocals for transcription"
+                        )
+                except Exception as e:
+                    logger.error(f"Demucs separation failed: {e}")
+                    logger.warning("Falling back to original audio")
+                    self.vocals_path = None
+                    self.no_vocals_path = None
+                pr.done("demucs")
+                self._check_cancelled("demucs")
 
             if "sound" in output_type:
-                prog_disp(
-                    "Separating sounds in the file...",
-                    0.50,
-                    is_gui,
-                    progress=progress
-                )
+                pr.step("output", "Separating sounds in the file...")
                 separate_out = sound_separate(base_audio_wav, output_type)
                 final_outputs = []
                 for out in separate_out:
@@ -688,18 +1364,14 @@ class SoniTranslate(SoniTrCache):
                 )
             ], {"vocals": self.vocals}):
                 if subtitle_file:
-                    prog_disp(
-                        "From SRT file...", 0.30, is_gui, progress=progress
-                    )
+                    pr.step("transcribe", "Loading from SRT file...")
                     audio = whisperx.load_audio(
                         base_audio_wav if not self.vocals else self.vocals
                     )
                     self.result = srt_file_to_segments(subtitle_file)
                     self.result["language"] = SOURCE_LANGUAGE
                 else:
-                    prog_disp(
-                        "Transcribing...", 0.30, is_gui, progress=progress
-                    )
+                    pr.step("transcribe", "Transcribing speech...")
                     SOURCE_LANGUAGE = (
                         None
                         if SOURCE_LANGUAGE == "Automatic detection"
@@ -718,13 +1390,15 @@ class SoniTranslate(SoniTrCache):
                     "Transcript complete, "
                     f"segments count {len(self.result['segments'])}"
                 )
+                pr.done("transcribe")
+                self._check_cancelled("transcribe")
 
                 self.align_language = self.result["language"]
                 if (
                     not subtitle_file
                     or text_segmentation_scale in ["word", "character"]
                 ):
-                    prog_disp("Aligning...", 0.45, is_gui, progress=progress)
+                    pr.step("align", "Aligning transcript to audio...")
                     try:
                         if self.align_language in ["vi"]:
                             logger.info(
@@ -741,6 +1415,8 @@ class SoniTranslate(SoniTrCache):
                             )
                     except Exception as error:
                         logger.error(str(error))
+                    pr.done("align")
+                    self._check_cancelled("align")
 
             if self.result["segments"] == []:
                 raise ValueError("No active speech found in audio")
@@ -777,7 +1453,7 @@ class SoniTranslate(SoniTrCache):
             ], {
                 "result": self.result
             }):
-                prog_disp("Diarizing...", 0.60, is_gui, progress=progress)
+                pr.step("diarize", "Diarizing speakers...")
                 diarize_model_select = diarization_models[diarization_model]
                 self.result_diarize = diarize_speech(
                     base_audio_wav if not self.vocals else self.vocals,
@@ -788,7 +1464,135 @@ class SoniTranslate(SoniTrCache):
                     diarize_model_select,
                 )
                 logger.debug("Diarize complete")
+                pr.done("diarize")
+                self._check_cancelled("diarize")
+                # Checkpoint: save diarization results
+                _save_pipeline_checkpoint(
+                    media_base_hash,
+                    result_diarize=self.result_diarize,
+                )
             self.result_source_lang = copy.deepcopy(self.result_diarize)
+
+            # Speaker gender detection and auto-voice assignment
+            if not self.task_in_cache("gender_detect", [
+                TRANSLATE_AUDIO_TO,
+            ], {
+                "result_diarize": self.result_diarize
+            }):
+                pr.step("gender", "Detecting speaker genders...")
+                try:
+                    audio_for_gender = (
+                        base_audio_wav if not self.vocals else self.vocals
+                    )
+                    self.speaker_info = detect_speakers_gender(
+                        audio_for_gender, self.result_diarize
+                    )
+                    self.auto_voice_assignments, self.speaker_info = (
+                        auto_assign_voices(
+                            self.speaker_info, TRANSLATE_AUDIO_TO
+                        )
+                    )
+                    logger.info(
+                        f"Speaker gender detection complete: "
+                        f"{self.speaker_info}"
+                    )
+                    logger.info(
+                        f"Auto voice assignments: "
+                        f"{self.auto_voice_assignments}"
+                    )
+                except Exception as error:
+                    logger.error(
+                        f"Gender detection failed: {error}. "
+                        "Using default voice assignments."
+                    )
+                    self.speaker_info = {}
+                    self.auto_voice_assignments = {}
+                pr.done("gender")
+                self._check_cancelled("gender")
+                # Checkpoint: save gender + voice assignments
+                _save_pipeline_checkpoint(
+                    media_base_hash,
+                    result_diarize=self.result_diarize,
+                    auto_voice_assignments=self.auto_voice_assignments,
+                    speaker_info=self.speaker_info,
+                )
+
+            # Extract per-speaker reference samples for voice cloning
+            self.speaker_sample_paths = {}
+            if use_per_speaker_cloning and hasattr(self, 'result_diarize'):
+                pr.step("voice_clone", "Extracting speaker voice samples...")
+                try:
+                    vocals_for_clone = (
+                        self.vocals_path
+                        if self.vocals_path and os.path.exists(self.vocals_path)
+                        else (base_audio_wav if not self.vocals else self.vocals)
+                    )
+                    self.speaker_sample_paths = extract_speaker_samples(
+                        self.result_diarize["segments"],
+                        vocals_for_clone,
+                    )
+                    logger.info(
+                        f"Extracted voice samples for "
+                        f"{len(self.speaker_sample_paths)} speakers"
+                    )
+                except Exception as e:
+                    logger.error(f"Speaker sample extraction failed: {e}")
+                pr.done("voice_clone")
+
+            # Extract room tone for room tone matching
+            self.room_sample_path = None
+            if use_room_tone and hasattr(self, 'result_diarize'):
+                try:
+                    vocals_for_room = (
+                        self.vocals_path
+                        if self.vocals_path and os.path.exists(self.vocals_path)
+                        else (base_audio_wav if not self.vocals else self.vocals)
+                    )
+                    self.room_sample_path = extract_room_sample(
+                        vocals_for_room,
+                        self.result_diarize["segments"],
+                        "audio/room_tone.wav",
+                    )
+                except Exception as e:
+                    logger.warning(f"Room tone extraction failed: {e}")
+
+            # Preview mode: filter to a segment from the source
+            if preview_mode and preview_duration > 0:
+                # Clip the media to preview segment FIRST
+                preview_start_val = float(preview_start) if preview_start else 0.0
+                preview_dur_val = float(preview_duration)
+                if preview_start_val > 0:
+                    clipped = self._clip_media_for_preview(
+                        base_audio_wav,
+                        base_video_file if not is_audio_file(media_file) else None,
+                        preview_start_val,
+                        preview_dur_val,
+                    )
+                    if clipped:
+                        if is_audio_file(media_file):
+                            base_audio_wav = clipped
+                        else:
+                            base_video_file = clipped
+                            # Re-extract audio from clipped video
+                            clipped_audio = base_audio_wav.rsplit(".", 1)[0] + "_clipped.wav"
+                            subprocess.run(
+                                f'ffmpeg -y -i "{base_video_file}" -vn -ar 16000 -ac 1 "{clipped_audio}"',
+                                shell=True, capture_output=True,
+                            )
+                            if os.path.exists(clipped_audio):
+                                base_audio_wav = clipped_audio
+
+                original_count = len(self.result_diarize["segments"])
+                self.result_diarize["segments"] = filter_segments_preview(
+                    self.result_diarize["segments"],
+                    preview_dur_val,
+                    start_time=preview_start_val,
+                )
+                logger.info(
+                    f"Preview mode: {len(self.result_diarize['segments'])} "
+                    f"segments (of {original_count} total, "
+                    f"{preview_start_val}s-{preview_start_val + preview_dur_val}s)"
+                )
 
             if not self.task_in_cache("translate", [
                 TRANSLATE_AUDIO_TO,
@@ -796,21 +1600,43 @@ class SoniTranslate(SoniTrCache):
             ], {
                 "result_diarize": self.result_diarize
             }):
-                prog_disp("Translating...", 0.70, is_gui, progress=progress)
+                pr.step("translate", "Translating text...")
                 lang_source = (
                     self.align_language
                     if self.align_language
                     else SOURCE_LANGUAGE
                 )
-                self.result_diarize["segments"] = translate_text(
-                    self.result_diarize["segments"],
-                    TRANSLATE_AUDIO_TO,
-                    translate_process,
-                    chunk_size=1800,
-                    source=lang_source,
-                )
+                try:
+                    self.result_diarize["segments"] = translate_text(
+                        self.result_diarize["segments"],
+                        TRANSLATE_AUDIO_TO,
+                        translate_process,
+                        chunk_size=1800,
+                        source=lang_source,
+                        openrouter_batch_size=openrouter_batch_size,
+                    )
+                except InterruptedError:
+                    raise PipelineCancelled("Cancelled during translation")
                 logger.debug("Translation complete")
                 logger.debug(self.result_diarize)
+                pr.done("translate")
+                self._check_cancelled("translate")
+                
+                # Analyze script for each speaker after translation
+                from soni_translate.speaker_gender import analyze_speaker_script
+                self.speaker_info = analyze_speaker_script(
+                    self.result_diarize["segments"],
+                    self.speaker_info,
+                )
+                logger.info("Script analysis complete for all speakers")
+                
+                # Checkpoint: save translation results
+                _save_pipeline_checkpoint(
+                    media_base_hash,
+                    result_diarize=self.result_diarize,
+                    auto_voice_assignments=self.auto_voice_assignments,
+                    speaker_info=self.speaker_info,
+                )
 
         if get_translated_text:
 
@@ -933,6 +1759,10 @@ class SoniTranslate(SoniTrCache):
             logger.info(f"Done: {msg_out}")
             return output
 
+        # Pause for voice review if requested
+        if getattr(self, '_stop_before_tts', False):
+            raise PipelinePausedForReview("Stopping for voice review")
+
         if not self.task_in_cache("tts", [
             TRANSLATE_AUDIO_TO,
             tts_voice00,
@@ -951,7 +1781,29 @@ class SoniTranslate(SoniTrCache):
         ], {
             "sub_file": self.sub_file
         }):
-            prog_disp("Text to speech...", 0.80, is_gui, progress=progress)
+            pr.step("tts", "Generating speech (TTS)...")
+
+            # Use auto-assigned voices if available
+            if hasattr(self, 'auto_voice_assignments') and self.auto_voice_assignments:
+                logger.info("Using auto-assigned voices based on speaker gender")
+                auto = self.auto_voice_assignments
+                tts_voice00 = auto.get("SPEAKER_00", tts_voice00)
+                tts_voice01 = auto.get("SPEAKER_01", tts_voice01)
+                tts_voice02 = auto.get("SPEAKER_02", tts_voice02)
+                tts_voice03 = auto.get("SPEAKER_03", tts_voice03)
+                tts_voice04 = auto.get("SPEAKER_04", tts_voice04)
+                tts_voice05 = auto.get("SPEAKER_05", tts_voice05)
+                tts_voice06 = auto.get("SPEAKER_06", tts_voice06)
+                tts_voice07 = auto.get("SPEAKER_07", tts_voice07)
+                tts_voice08 = auto.get("SPEAKER_08", tts_voice08)
+                tts_voice09 = auto.get("SPEAKER_09", tts_voice09)
+                tts_voice10 = auto.get("SPEAKER_10", tts_voice10)
+                tts_voice11 = auto.get("SPEAKER_11", tts_voice11)
+                logger.info(
+                    f"Voice assignments: 00={tts_voice00}, 01={tts_voice01}, "
+                    f"02={tts_voice02}, 03={tts_voice03}"
+                )
+
             self.valid_speakers = audio_segmentation_to_voice(
                 self.result_diarize,
                 TRANSLATE_AUDIO_TO,
@@ -969,7 +1821,11 @@ class SoniTranslate(SoniTrCache):
                 tts_voice10,
                 tts_voice11,
                 dereverb_automatic_xtts,
+                vocals_path=self.vocals_path if hasattr(self, 'vocals_path') else None,
+                prosody_enabled=use_prosody_transfer,
             )
+            pr.done("tts")
+            self._check_cancelled("tts")
 
         if not self.task_in_cache("acc_and_vc", [
             max_accelerate_audio,
@@ -995,9 +1851,7 @@ class SoniTranslate(SoniTrCache):
 
             # Voice Imitation (Tone color converter)
             if voice_imitation:
-                prog_disp(
-                    "Voice Imitation...", 0.85, is_gui, progress=progress
-                )
+                pr.step("voice_imit", "Applying voice imitation...")
                 from soni_translate.text_to_speech import toneconverter
 
                 try:
@@ -1010,15 +1864,11 @@ class SoniTranslate(SoniTrCache):
                     )
                 except Exception as error:
                     logger.error(str(error))
+                pr.done("voice_imit")
 
             # custom voice
             if custom_voices:
-                prog_disp(
-                    "Applying customized voices...",
-                    0.90,
-                    is_gui,
-                    progress=progress,
-                )
+                pr.step("custom_voices", "Applying custom voices...")
 
                 try:
                     self.vci(
@@ -1030,13 +1880,9 @@ class SoniTranslate(SoniTrCache):
                     self.vci.unload_models()
                 except Exception as error:
                     logger.error(str(error))
+                pr.done("custom_voices")
 
-            prog_disp(
-                "Creating final translated video...",
-                0.95,
-                is_gui,
-                progress=progress,
-            )
+            pr.step("output", "Creating final translated audio...")
             remove_files(dub_audio_file)
             create_translated_audio(
                 self.result_diarize,
@@ -1044,7 +1890,53 @@ class SoniTranslate(SoniTrCache):
                 dub_audio_file,
                 False,
                 avoid_overlap,
+                original_vocals_path=self.vocals if hasattr(self, 'vocals') and self.vocals else None,
+                sync_enabled=use_sync_alignment,
             )
+            pr.done("output")
+
+            # Audio enhancement: loudness normalization + room tone
+            if (use_loudness_normalization or use_room_tone) and os.path.exists(dub_audio_file):
+                pr.step("enhance", "Enhancing audio quality...")
+                enhanced_file = "audio_dub_enhanced.wav"
+                try:
+                    enhanced_file = _enhance_dubbed_audio(
+                        self.result_diarize,
+                        dub_audio_file,
+                        enhanced_file,
+                        use_loudness_normalization,
+                        use_room_tone,
+                        self.room_sample_path,
+                        audio_dir="audio",
+                    )
+                    if os.path.exists(enhanced_file):
+                        dub_audio_file = enhanced_file
+                        logger.info(f"Enhanced audio: {dub_audio_file}")
+                except Exception as e:
+                    logger.error(f"Audio enhancement failed: {e}")
+                pr.done("enhance")
+
+            # Timing fixes: time-stretch TTS to fit slots
+            if use_loudness_normalization and os.path.exists(dub_audio_file):
+                pr.step("timing", "Adjusting timing...")
+                try:
+                    _apply_timing_fixes(
+                        self.result_diarize,
+                        audio_dir="audio",
+                    )
+                except Exception as e:
+                    logger.error(f"Timing fixes failed: {e}")
+                pr.done("timing")
+                self._check_cancelled("timing")
+
+            # Save segment manifest for retry
+            try:
+                manifest_data = _build_segment_manifest(
+                    self.result_diarize, audio_files
+                )
+                save_segment_manifest(manifest_data)
+            except Exception as e:
+                logger.debug(f"Could not save manifest: {e}")
 
         # Voiceless track, change with file
         hash_base_audio_wav = get_hash(base_audio_wav)
@@ -1105,6 +1997,12 @@ class SoniTranslate(SoniTrCache):
             )
             msg_out = output[0] if isinstance(output, list) else output
             logger.info(f"Done: {msg_out}")
+            # Copy to Google Drive
+            if isinstance(output, list):
+                for f in output:
+                    copy_to_drive(f)
+            else:
+                copy_to_drive(output)
             return output
 
         hash_base_video_file = get_hash(base_video_file)
@@ -1149,6 +2047,16 @@ class SoniTranslate(SoniTrCache):
         )
         msg_out = output[0] if isinstance(output, list) else output
         logger.info(f"Done: {msg_out}")
+
+        # Pipeline complete — clear checkpoint
+        _clear_pipeline_checkpoint(media_base_hash)
+
+        # Copy to Google Drive
+        if isinstance(output, list):
+            for f in output:
+                copy_to_drive(f)
+        else:
+            copy_to_drive(output)
 
         return output
 
@@ -1476,6 +2384,14 @@ def create_gui(theme, logs_in_gui=False):
                         file_count="multiple",
                         type="filepath",
                     )
+                    with gr.Row():
+                        cancel_upload_button = gr.Button(
+                            "Cancel Upload",
+                            variant="stop",
+                            size="sm",
+                            visible=False,
+                        )
+                        upload_status = gr.Markdown("")
                     blink_input = gr.Textbox(
                         visible=False,
                         label=lg_conf["link_label"],
@@ -1504,7 +2420,7 @@ def create_gui(theme, logs_in_gui=False):
                     )
                     TRANSLATE_AUDIO_TO = gr.Dropdown(
                         LANGUAGES_LIST[1:],
-                        value="English (en)",
+                        value="Hindistani (hi-ur)",
                         label=lg_conf["tat_label"],
                         info=lg_conf["tat_info"],
                     )
@@ -1524,7 +2440,7 @@ def create_gui(theme, logs_in_gui=False):
                     max_speakers = gr.Slider(
                         1,
                         MAX_TTS,
-                        value=2,
+                        value=12,
                         step=1,
                         label=lg_conf["max_sk"],
                     )
@@ -1647,7 +2563,7 @@ def create_gui(theme, logs_in_gui=False):
                         ):
                             gr.Markdown(lg_conf["vc_subtitle"])
                             voice_imitation_gui = gr.Checkbox(
-                                False,
+                                True,
                                 label=lg_conf["vc_active_label"],
                                 info=lg_conf["vc_active_info"],
                             )
@@ -1659,14 +2575,14 @@ def create_gui(theme, logs_in_gui=False):
                             )
                             voice_imitation_method_gui = gr.Dropdown(
                                 voice_imitation_method_options,
-                                value=voice_imitation_method_options[0],
+                                value="openvoice_v2",
                                 label=lg_conf["vc_method_label"],
                                 info=lg_conf["vc_method_info"],
                             )
                             voice_imitation_max_segments_gui = gr.Slider(
                                 label=lg_conf["vc_segments_label"],
                                 info=lg_conf["vc_segments_info"],
-                                value=3,
+                                value=4,
                                 step=1,
                                 minimum=1,
                                 maximum=10,
@@ -1674,7 +2590,7 @@ def create_gui(theme, logs_in_gui=False):
                                 interactive=True,
                             )
                             voice_imitation_vocals_dereverb_gui = gr.Checkbox(
-                                False,
+                                True,
                                 label=lg_conf["vc_dereverb_label"],
                                 info=lg_conf["vc_dereverb_info"],
                             )
@@ -1749,7 +2665,7 @@ def create_gui(theme, logs_in_gui=False):
                                 info=lg_conf["acc_max_info"],
                             )
                             acceleration_rate_regulation_gui = gr.Checkbox(
-                                False,
+                                True,
                                 label=lg_conf["acc_rate_label"],
                                 info=lg_conf["acc_rate_info"],
                             )
@@ -1767,7 +2683,7 @@ def create_gui(theme, logs_in_gui=False):
                             ]
                             AUDIO_MIX = gr.Dropdown(
                                 audio_mix_options,
-                                value=audio_mix_options[1],
+                                value=audio_mix_options[0],
                                 label=lg_conf["aud_mix_label"],
                                 info=lg_conf["aud_mix_info"],
                             )
@@ -1794,6 +2710,68 @@ def create_gui(theme, logs_in_gui=False):
                             main_voiceless_track = gr.Checkbox(
                                 label=lg_conf["voiceless_tk_label"],
                                 info=lg_conf["voiceless_tk_info"],
+                                value=True,
+                            )
+
+                            gr.HTML("<hr></h2>")
+                            gr.Markdown("**Audio Enhancement**")
+
+                            use_demucs_checkbox = gr.Checkbox(
+                                label="Demucs Source Separation",
+                                info="Separates vocals from background music before dubbing. Cleaner ASR + preserves BGM.",
+                                value=True,
+                            )
+                            use_per_speaker_checkbox = gr.Checkbox(
+                                label="Per-Speaker Voice Cloning",
+                                info="Extracts each speaker's voice for XTTS cloning. More natural multi-speaker dubbing.",
+                                value=True,
+                            )
+                            use_loudness_checkbox = gr.Checkbox(
+                                label="Loudness Normalization",
+                                info="Matches TTS loudness (LUFS) to original speaker.",
+                                value=True,
+                            )
+                            use_room_tone_checkbox = gr.Checkbox(
+                                label="Room Tone Matching",
+                                info="Applies subtle room ambience to TTS so it doesn't sound studio-dry.",
+                                value=True,
+                            )
+                            use_sync_checkbox = gr.Checkbox(
+                                label="Sync Alignment (anchor-based)",
+                                info="Aligns TTS to exact speech boundaries in original vocals, not just subtitle timestamps.",
+                                value=True,
+                            )
+                            use_prosody_checkbox = gr.Checkbox(
+                                label="Prosody Transfer",
+                                info="Adapts TTS pitch, energy, and emotion to match original speaker per segment.",
+                                value=True,
+                            )
+                            preview_mode_checkbox = gr.Checkbox(
+                                label="Preview Mode (clip segment for quick QA)",
+                                info="Clip a segment from the source for quick testing.",
+                                value=False,
+                            )
+                            preview_duration_slider = gr.Slider(
+                                minimum=10,
+                                maximum=120,
+                                value=60,
+                                step=5,
+                                label="Preview Duration (seconds)",
+                                visible=False,
+                            )
+                            preview_start_slider = gr.Slider(
+                                minimum=0,
+                                maximum=600,
+                                value=0,
+                                step=5,
+                                label="Preview Start (seconds from beginning, 0 = start of file)",
+                                info="Set > 0 to sample from middle of video. E.g. 300 = start at 5 minutes.",
+                                visible=False,
+                            )
+                            preview_mode_checkbox.change(
+                                lambda x: [gr.update(visible=x), gr.update(visible=x)],
+                                inputs=[preview_mode_checkbox],
+                                outputs=[preview_duration_slider, preview_start_slider],
                             )
 
                             gr.HTML("<hr></h2>")
@@ -1869,7 +2847,7 @@ def create_gui(theme, logs_in_gui=False):
                             batch_size = gr.Slider(
                                 minimum=1,
                                 maximum=32,
-                                value=8,
+                                value=32,
                                 label=lg_conf["batchz_label"],
                                 info=lg_conf["batchz_info"],
                                 step=1,
@@ -1909,14 +2887,22 @@ def create_gui(theme, logs_in_gui=False):
                             )
                             translate_process_dropdown = gr.Dropdown(
                                 TRANSLATION_PROCESS_OPTIONS,
-                                value=TRANSLATION_PROCESS_OPTIONS[0],
+                                value="openrouter_batch",
                                 label=lg_conf["tr_process_label"],
+                            )
+                            openrouter_batch_size = gr.Number(
+                                value=20,
+                                label="OpenRouter Batch Size",
+                                info="Lines per API request (10-1000). Higher = fewer requests but larger payloads.",
+                                minimum=1,
+                                maximum=1000,
+                                step=1,
                             )
 
                             gr.HTML("<hr></h2>")
                             main_output_type = gr.Dropdown(
                                 OUTPUT_TYPE_OPTIONS,
-                                value=OUTPUT_TYPE_OPTIONS[0],
+                                value="audio (mp3)",
                                 label=lg_conf["out_type_label"],
                             )
                             VIDEO_OUTPUT_NAME = gr.Textbox(
@@ -1985,6 +2971,12 @@ def create_gui(theme, logs_in_gui=False):
                             variant="primary",
                         )
                     with gr.Row():
+                        cancel_button = gr.Button(
+                            "Cancel Pipeline",
+                            variant="stop",
+                            visible=True,
+                        )
+                    with gr.Row():
                         video_output = gr.File(
                             label=lg_conf["output_result_label"],
                             file_count="multiple",
@@ -1993,6 +2985,311 @@ def create_gui(theme, logs_in_gui=False):
                         )  # gr.Video()
 
                     gr.HTML("<hr></h2>")
+
+                    # Speaker Voice Review Panel — pauses pipeline for user
+                    with gr.Accordion(
+                        "Speaker Voice Assignment — Review Before TTS",
+                        open=True,
+                    ):
+                        gr.Markdown(
+                            "**Pipeline pauses here after gender detection.**\n"
+                            "1. Choose voice source: **Coqui XTTS** (default) or **Audio Sample** (upload .wav/.mp3).\n"
+                            "2. For Audio Sample: Name each file as `Name-gender.wav` (e.g. `Abhinav-male.wav`, `priya-female.wav`).\n"
+                            "3. System auto-maps speakers to voices by gender.\n"
+                            "4. **Adjust mappings** if needed, then click **Confirm Voices & Start TTS**."
+                        )
+
+                        voice_mode = gr.Radio(
+                            choices=["Coqui XTTS", "Audio Sample"],
+                            value="Coqui XTTS",
+                            label="Voice Source",
+                            info="Coqui XTTS: Use pre-trained XTTS voices | Audio Sample: Upload your own voice samples",
+                        )
+
+                        voice_sample_files = gr.File(
+                            label="Upload Voice Samples (.wav/.mp3 — filename = Name-gender)",
+                            file_count="multiple",
+                            file_types=[".wav", ".mp3", ".ogg", ".m4a"],
+                            height=120,
+                            visible=False,
+                        )
+                        with gr.Row():
+                            match_samples_button = gr.Button(
+                                "Match Samples to Speakers",
+                                variant="secondary",
+                                size="sm",
+                                visible=False,
+                            )
+                        voice_sample_status = gr.Markdown("")
+
+                        speaker_gender_info = gr.Markdown(
+                            "Run translation first to see speaker analysis."
+                        )
+
+                        speaker_review_rows = []
+                        for i in range(12):
+                            with gr.Row(visible=False) as spk_row:
+                                spk_label = gr.Markdown(f"**SPEAKER_{i:02d}**")
+                                spk_gender = gr.Markdown("—")
+                                spk_f0 = gr.Markdown("—")
+                                spk_script = gr.Markdown("—")
+                                spk_sample = gr.Markdown("*Sample: —*", elem_classes="script-sample")
+                                spk_audio = gr.Audio(
+                                    label="Demucs Vocal Sample",
+                                    interactive=False,
+                                    visible=True,
+                                    type="filepath",
+                                )
+                                spk_voice = gr.Dropdown(
+                                    choices=[],
+                                    label="Assigned Voice",
+                                    interactive=True,
+                                )
+                            speaker_review_rows.append({
+                                "row": spk_row,
+                                "label": spk_label,
+                                "gender": spk_gender,
+                                "f0": spk_f0,
+                                "script": spk_script,
+                                "sample": spk_sample,
+                                "audio": spk_audio,
+                                "voice": spk_voice,
+                            })
+
+                        confirm_voices_button = gr.Button(
+                            "Confirm Voices & Start TTS",
+                            variant="primary",
+                            visible=False,
+                        )
+
+                    def show_speaker_assignments(uploaded_files, voice_mode="Coqui XTTS"):
+                        """Populate the review panel after gender detection completes.
+                        
+                        Args:
+                            uploaded_files: List of uploaded voice sample files
+                            voice_mode: "Coqui XTTS" or "Audio Sample"
+                        """
+                        updates = []
+                        
+                        # Build choices based on mode
+                        voice_choices = [""]
+                        voice_samples = []
+                        sample_status = ""
+                        
+                        if voice_mode == "Audio Sample":
+                            # Use uploaded voice samples
+                            if uploaded_files:
+                                from soni_translate.speaker_gender import (
+                                    parse_uploaded_voice_samples,
+                                )
+                                file_paths = [f if isinstance(f, str) else f.name for f in uploaded_files]
+                                voice_samples, samples_by_gender = parse_uploaded_voice_samples(file_paths)
+                                SoniTr._voice_samples = voice_samples
+                                voice_choices = [""] + [
+                                    f"{s['identity']}-{s['gender']}" for s in voice_samples
+                                ]
+                                status_parts = [f"**{len(voice_samples)} samples loaded:**"]
+                                for s in voice_samples:
+                                    status_parts.append(f"  - {s['identity']} ({s['gender']})")
+                                sample_status = "\n".join(status_parts)
+                            else:
+                                SoniTr._voice_samples = []
+                                sample_status = "*No voice samples uploaded. Upload .wav/.mp3 files named `Name-gender.wav`.*"
+                        else:
+                            # Use Coqui XTTS voices (Edge TTS voices with gender info)
+                            from soni_translate.speaker_gender import get_available_voices_for_target
+                            
+                            # Get target language from SoniTr
+                            target_lang = getattr(SoniTr, '_target_lang', 'hi')
+                            
+                            # Get available voices for target language
+                            edge_voices = get_available_voices_for_target(target_lang, engine="edge")
+                            male_voices = edge_voices.get("male", [])
+                            female_voices = edge_voices.get("female", [])
+                            
+                            # Build choices with gender info
+                            voice_choices = [""] + [
+                                f"{v}" for v in male_voices + female_voices
+                            ]
+                            SoniTr._voice_samples = []  # No samples in XTTS mode
+                            sample_status = (
+                                f"**{len(male_voices)} male + {len(female_voices)} female XTTS voices available.**\n"
+                                "Auto-assigned by gender. Adjust if needed."
+                            )
+
+                        if not hasattr(SoniTr, 'speaker_info') or not SoniTr.speaker_info:
+                            # No speakers detected — hide all 12 rows + info + button
+                            for _ in range(12):
+                                updates.extend([
+                                    gr.update(visible=False),  # row
+                                    gr.update(),               # label
+                                    gr.update(),               # gender
+                                    gr.update(),               # f0
+                                    gr.update(),               # script
+                                    gr.update(),               # sample
+                                    gr.update(),               # audio
+                                    gr.update(),               # voice dropdown
+                                ])
+                            updates.append(gr.update(value="No speakers detected."))
+                            updates.append(gr.update(visible=False))
+                            updates.append(gr.update(value=sample_status))
+                            return updates
+
+                        # Auto-map speakers to voices by gender and script
+                        from soni_translate.speaker_gender import (
+                            get_default_voice_for_script,
+                            get_available_voices_for_target,
+                        )
+                        target_lang = getattr(SoniTr, '_target_lang', 'hi')
+                        
+                        if voice_mode == "Audio Sample" and voice_samples:
+                            from soni_translate.speaker_gender import auto_map_speakers_to_samples
+                            auto = auto_map_speakers_to_samples(
+                                SoniTr.speaker_info, samples_by_gender
+                            )
+                            SoniTr.auto_voice_assignments = auto
+                        else:
+                            # Use existing auto-assignments (from Edge TTS or previous assignment)
+                            auto = getattr(SoniTr, 'auto_voice_assignments', {})
+                            if not auto:
+                                # If no existing assignments, create new ones based on gender AND script
+                                auto = {}
+                                for spk, info in SoniTr.speaker_info.items():
+                                    gender = info.get("gender", "male")
+                                    script = info.get("script", "unknown")
+                                    # Get default voice based on script and gender
+                                    auto[spk] = get_default_voice_for_script(
+                                        script, gender, target_lang
+                                    )
+                                SoniTr.auto_voice_assignments = auto
+
+                        speakers = sorted(SoniTr.speaker_info.keys())
+
+                        for i in range(12):
+                            if i < len(speakers):
+                                spk = speakers[i]
+                                info = SoniTr.speaker_info[spk]
+                                gender = info.get("gender", "unknown")
+                                f0 = info.get("f0")
+                                f0_str = f"{f0:.1f} Hz" if f0 else "N/A"
+                                sample = info.get("sample_audio")
+                                assigned_voice = auto.get(spk, "")
+                                
+                                # Script analysis info
+                                script = info.get("script", "unknown")
+                                script_desc = info.get("script_description", "No text")
+                                script_sample = info.get("script_sample", "")
+                                
+                                if gender == "male":
+                                    gender_text = "Male"
+                                elif gender == "female":
+                                    gender_text = "Female"
+                                else:
+                                    gender_text = "Unknown"
+                                
+                                # Script display
+                                if script == "devanagari":
+                                    script_text = f"**Script:** Devanagari/Hindi"
+                                elif script == "latin":
+                                    script_text = f"**Script:** English/Latin"
+                                elif script == "urdu":
+                                    script_text = f"**Script:** Urdu"
+                                elif script == "mixed":
+                                    script_text = f"**Script:** Mixed (Hindi + English)"
+                                else:
+                                    script_text = f"**Script:** Unknown"
+                                
+                                # Sample display
+                                if script_sample:
+                                    sample_display = f"*Sample:* `{script_sample}`"
+                                else:
+                                    sample_display = "*Sample:* —"
+
+                                # Set voice dropdown value
+                                voice_val = assigned_voice if assigned_voice in voice_choices else None
+
+                                updates.extend([
+                                    gr.update(visible=True),
+                                    gr.update(value=f"**{spk}**"),
+                                    gr.update(value=gender_text),
+                                    gr.update(value=f"F0: {f0_str}"),
+                                    gr.update(value=script_text),
+                                    gr.update(value=sample_display),
+                                    gr.update(value=sample if sample and os.path.exists(sample) else None),
+                                    gr.update(choices=voice_choices, value=voice_val),
+                                ])
+                            else:
+                                updates.extend([
+                                    gr.update(visible=False),
+                                    gr.update(), gr.update(), gr.update(),
+                                    gr.update(), gr.update(), gr.update(), gr.update(),
+                                ])
+
+                        summary = (
+                            f"**{len(speakers)} speakers detected.** "
+                            f"Mode: **{voice_mode}**. "
+                            "Review and adjust mappings below, then confirm."
+                        )
+                        updates.append(gr.update(value=summary))
+                        updates.append(gr.update(visible=True))
+                        updates.append(gr.update(value=sample_status))
+                        return updates
+
+                    def continue_with_confirmed_voices(*dropdown_values):
+                        """User clicked confirm — update assignments and run TTS."""
+                        if not hasattr(SoniTr, 'speaker_info') or not SoniTr.speaker_info:
+                            placeholder = "outputs/no_output.txt"
+                            os.makedirs("outputs", exist_ok=True)
+                            with open(placeholder, "w") as f:
+                                f.write("No speaker data found. Run translation again.\n")
+                            return [placeholder]
+
+                        from soni_translate.speaker_gender import (
+                            get_sample_path_by_identity,
+                            check_voice_script_match,
+                        )
+                        voice_samples = getattr(SoniTr, '_voice_samples', [])
+                        warnings = []
+
+                        speakers = sorted(SoniTr.speaker_info.keys())
+                        for i, spk in enumerate(speakers):
+                            if i < len(dropdown_values) and dropdown_values[i]:
+                                identity_key = dropdown_values[i]
+                                sample_path = get_sample_path_by_identity(identity_key, voice_samples)
+                                
+                                # Check if this is an uploaded sample or a TTS voice
+                                if sample_path:
+                                    # Uploaded sample — no script check needed
+                                    SoniTr.auto_voice_assignments[spk] = sample_path
+                                    logger.info(f"User confirmed: {spk} -> {identity_key} ({sample_path})")
+                                else:
+                                    # TTS voice — check script match
+                                    voice_name = identity_key
+                                    script = SoniTr.speaker_info[spk].get("script", "unknown")
+                                    is_match, warning_msg = check_voice_script_match(voice_name, script)
+                                    
+                                    SoniTr.auto_voice_assignments[spk] = voice_name
+                                    logger.info(f"User confirmed: {spk} -> {voice_name}")
+                                    
+                                    if warning_msg:
+                                        warnings.append(f"**{spk}:** {warning_msg}")
+                        
+                        # Log warnings but don't block
+                        if warnings:
+                            warning_text = "\n".join(warnings)
+                            logger.warning(f"Voice-script mismatches detected:\n{warning_text}")
+
+                        # Continue pipeline from TTS step
+                        try:
+                            result = SoniTr.run_from_tts()
+                            return result if result else ["outputs/done.txt"]
+                        except Exception as e:
+                            logger.error(f"Pipeline continuation failed: {e}")
+                            placeholder = "outputs/error.txt"
+                            os.makedirs("outputs", exist_ok=True)
+                            with open(placeholder, "w") as f:
+                                f.write(f"Error: {e}\n")
+                            return [placeholder]
 
                     if (
                         os.getenv("YOUR_HF_TOKEN") is None
@@ -2012,44 +3309,58 @@ def create_gui(theme, logs_in_gui=False):
                             placeholder=lg_conf["ht_token_ph"],
                         )
 
-                    gr.Examples(
-                        examples=[
-                            [
-                                ["./assets/Video_main.mp4"],
-                                "",
-                                "",
-                                "",
-                                False,
-                                whisper_model_default,
-                                4,
-                                com_t_default,
-                                "Spanish (es)",
-                                "English (en)",
-                                1,
-                                2,
-                                "en-CA-ClaraNeural-Female",
-                                "en-AU-WilliamNeural-Male",
-                            ],
-                        ],  # no update
-                        fn=SoniTr.batch_multilingual_media_conversion,
-                        inputs=[
-                            video_input,
-                            blink_input,
-                            directory_input,
-                            HFKEY,
-                            PREVIEW,
-                            WHISPER_MODEL_SIZE,
-                            batch_size,
-                            compute_type,
-                            SOURCE_LANGUAGE,
-                            TRANSLATE_AUDIO_TO,
-                            min_speakers,
-                            max_speakers,
-                            tts_voice00,
-                            tts_voice01,
-                        ],
-                        outputs=[video_output],
-                        cache_examples=False,
+                    OPENROUTER_KEY = gr.Textbox(
+                        visible=True,
+                        label="OpenRouter API Key (Primary)",
+                        info="Required for OpenRouter translation. Get free key at https://openrouter.ai/keys",
+                        placeholder="sk-or-v1-...",
+                        type="password",
+                    )
+
+                    OPENROUTER_KEY_2 = gr.Textbox(
+                        visible=True,
+                        label="OpenRouter API Key (2nd - Failover)",
+                        info="Optional. Auto-switches when primary hits rate limit.",
+                        placeholder="sk-or-v1-...",
+                        type="password",
+                    )
+
+                    OPENROUTER_KEY_3 = gr.Textbox(
+                        visible=True,
+                        label="OpenRouter API Key (3rd - Failover)",
+                        info="Optional. Cycles through all keys on rate limit.",
+                        placeholder="sk-or-v1-...",
+                        type="password",
+                    )
+
+                    # Set OPENROUTER keys and load into pool
+                    def set_openrouter_keys_ui(k1, k2, k3):
+                        keys = [k for k in [k1, k2, k3] if k and k.strip()]
+                        if k1:
+                            os.environ["OPENROUTER_API_KEY"] = k1
+                        if k2:
+                            os.environ["OPENROUTER_API_KEY_2"] = k2
+                        if k3:
+                            os.environ["OPENROUTER_API_KEY_3"] = k3
+                        from soni_translate.translate_segments import set_openrouter_keys as _set_keys
+                        _set_keys([k for k in [k1, k2, k3] if k and k.strip()])
+                        n = len([k for k in [k1, k2, k3] if k and k.strip()])
+                        return f"Loaded {n} API key(s). Will auto-switch on rate limit."
+
+                    OPENROUTER_KEY.change(
+                        lambda k1, k2, k3: set_openrouter_keys_ui(k1, k2, k3),
+                        inputs=[OPENROUTER_KEY, OPENROUTER_KEY_2, OPENROUTER_KEY_3],
+                        outputs=[],
+                    )
+                    OPENROUTER_KEY_2.change(
+                        lambda k1, k2, k3: set_openrouter_keys_ui(k1, k2, k3),
+                        inputs=[OPENROUTER_KEY, OPENROUTER_KEY_2, OPENROUTER_KEY_3],
+                        outputs=[],
+                    )
+                    OPENROUTER_KEY_3.change(
+                        lambda k1, k2, k3: set_openrouter_keys_ui(k1, k2, k3),
+                        inputs=[OPENROUTER_KEY, OPENROUTER_KEY_2, OPENROUTER_KEY_3],
+                        outputs=[],
                     )
 
         with gr.Tab(lg_conf["tab_docs"]):
@@ -2641,6 +3952,7 @@ def create_gui(theme, logs_in_gui=False):
                 segment_duration_limit_gui,
                 diarization_process_dropdown,
                 translate_process_dropdown,
+                openrouter_batch_size,
                 input_srt,
                 main_output_type,
                 main_voiceless_track,
@@ -2664,9 +3976,25 @@ def create_gui(theme, logs_in_gui=False):
             play_sound_alert, [play_sound_gui], [sound_alert_notification]
         )
 
-        # Run translate tts and complete
-        video_button.click(
-            SoniTr.batch_multilingual_media_conversion,
+        # Run translate — pauses at gender detection for voice review
+        def translate_or_queue(*args):
+            """Run translate immediately, or queue if upload is in progress."""
+            if SoniTr._uploading:
+                SoniTr.queue_translate(*args)
+                return (
+                    None,
+                    gr.update(interactive=False, value="Queued — starts when upload finishes"),
+                )
+            SoniTr.reset_cancel()
+            result = SoniTr.run_until_gender_detection(*args)
+            # run_until_gender_detection returns [placeholder], but we need (video_output, button_update)
+            return (
+                result,
+                gr.update(interactive=True, value=lg_conf["button_translate"]),
+            )
+
+        video_button_event = video_button.click(
+            translate_or_queue,
             inputs=[
                 video_input,
                 blink_input,
@@ -2708,6 +4036,7 @@ def create_gui(theme, logs_in_gui=False):
                 segment_duration_limit_gui,
                 diarization_process_dropdown,
                 translate_process_dropdown,
+                openrouter_batch_size,
                 input_srt,
                 main_output_type,
                 main_voiceless_track,
@@ -2724,12 +4053,182 @@ def create_gui(theme, logs_in_gui=False):
                 enable_cache_gui,
                 enable_custom_voice,
                 workers_custom_voice,
+                use_demucs_checkbox,
+                use_per_speaker_checkbox,
+                use_loudness_checkbox,
+                use_room_tone_checkbox,
+                use_sync_checkbox,
+                use_prosody_checkbox,
+                preview_mode_checkbox,
+                preview_duration_slider,
+                preview_start_slider,
                 is_gui_dummy_check,
             ],
-            outputs=video_output,
+            outputs=[video_output, video_button],
             trigger_mode="multiple",
         ).then(
+            show_speaker_assignments,
+            inputs=[voice_sample_files, voice_mode],
+            outputs=[
+                # 12 speaker rows x 6 components each
+                comp for row in speaker_review_rows for comp in [
+                    row["row"], row["label"], row["gender"],
+                    row["f0"], row["script"], row["sample"],
+                    row["audio"], row["voice"],
+                ]
+            ] + [speaker_gender_info, confirm_voices_button, voice_sample_status],
+        ).then(
             play_sound_alert, [play_sound_gui], [sound_alert_notification]
+        )
+
+        # Confirm voices — user reviewed, now continue to TTS
+        confirm_voices_button.click(
+            continue_with_confirmed_voices,
+            inputs=[row["voice"] for row in speaker_review_rows],
+            outputs=[video_output],
+        ).then(
+            play_sound_alert, [play_sound_gui], [sound_alert_notification]
+        )
+
+        # Cancel pipeline — stops at next checkpoint
+        cancel_button.click(
+            SoniTr.cancel_pipeline,
+            inputs=[],
+            outputs=[],
+            cancels=[video_button_event],
+        )
+
+        # Match samples to speakers — manual trigger after upload
+        match_samples_button.click(
+            show_speaker_assignments,
+            inputs=[voice_sample_files, voice_mode],
+            outputs=[
+                comp for row in speaker_review_rows for comp in [
+                    row["row"], row["label"], row["gender"],
+                    row["f0"], row["script"], row["sample"],
+                    row["audio"], row["voice"],
+                ]
+            ] + [speaker_gender_info, confirm_voices_button, voice_sample_status],
+        )
+
+        # Auto-match when samples are uploaded (even during translation)
+        voice_sample_files.change(
+            show_speaker_assignments,
+            inputs=[voice_sample_files, voice_mode],
+            outputs=[
+                comp for row in speaker_review_rows for comp in [
+                    row["row"], row["label"], row["gender"],
+                    row["f0"], row["script"], row["sample"],
+                    row["audio"], row["voice"],
+                ]
+            ] + [speaker_gender_info, confirm_voices_button, voice_sample_status],
+        )
+
+        # Toggle visibility of upload section based on voice mode
+        def _on_voice_mode_change(mode):
+            """Show/hide upload section based on voice mode selection."""
+            if mode == "Audio Sample":
+                return (
+                    gr.update(visible=True),   # voice_sample_files
+                    gr.update(visible=True),   # match_samples_button
+                )
+            else:
+                return (
+                    gr.update(visible=False),  # voice_sample_files
+                    gr.update(visible=False),  # match_samples_button
+                )
+
+        voice_mode.change(
+            _on_voice_mode_change,
+            inputs=[voice_mode],
+            outputs=[voice_sample_files, match_samples_button],
+        )
+
+        # Also update speaker assignments when voice mode changes
+        voice_mode.change(
+            show_speaker_assignments,
+            inputs=[voice_sample_files, voice_mode],
+            outputs=[
+                comp for row in speaker_review_rows for comp in [
+                    row["row"], row["label"], row["gender"],
+                    row["f0"], row["script"], row["sample"],
+                    row["audio"], row["voice"],
+                ]
+            ] + [speaker_gender_info, confirm_voices_button, voice_sample_status],
+        )
+
+        # ---- Upload-awareness: disable translate while file is uploading ----
+        def _on_file_change(files):
+            """Fires when user selects/clears a file. 
+            Disable translate button while upload is in progress."""
+            if files:
+                SoniTr._uploading = True
+                SoniTr._upload_cancel_event.clear()
+                return (
+                    gr.update(interactive=False, value="Uploading… wait"),
+                    gr.update(visible=True),
+                    gr.update(value="⏳ Uploading file, please wait…"),
+                )
+            # File cleared - reset everything
+            SoniTr._uploading = False
+            SoniTr._upload_args_queue = None
+            SoniTr._upload_cancel_event.clear()
+            return (
+                gr.update(interactive=True, value=lg_conf["button_translate"]),
+                gr.update(visible=False),
+                gr.update(value=""),
+            )
+
+        def _on_file_upload(files):
+            """Re-enable translate button when upload completes. Run queued translate if any."""
+            if SoniTr._upload_cancel_event.is_set():
+                # Upload was cancelled - already handled by _on_cancel_upload
+                SoniTr._upload_cancel_event.clear()
+                SoniTr._uploading = False
+                return (
+                    gr.update(interactive=True, value=lg_conf["button_translate"]),
+                    gr.update(visible=False),
+                    gr.update(value=""),
+                )
+            SoniTr._uploading = False
+            if files:
+                queued = SoniTr.run_queued_translate()
+                if queued is not None:
+                    # Queued translate started - don't re-enable button yet, let the pipeline handle it
+                    pass
+            return (
+                gr.update(interactive=True, value=lg_conf["button_translate"]),
+                gr.update(visible=False),
+                gr.update(value="✅ Upload complete. Ready to translate."),
+            )
+
+        def _on_cancel_upload():
+            """Cancel the current upload by clearing the file input."""
+            SoniTr.cancel_upload()
+            SoniTr._uploading = False
+            SoniTr._upload_args_queue = None
+            # Clear the file input - this will trigger change event with files=None
+            return (
+                gr.update(value=None),
+                gr.update(interactive=True, value=lg_conf["button_translate"]),
+                gr.update(visible=False),
+                gr.update(value="❌ Upload cancelled."),
+            )
+
+        video_input.change(
+            _on_file_change,
+            inputs=[video_input],
+            outputs=[video_button, cancel_upload_button, upload_status],
+        )
+        video_input.upload(
+            _on_file_upload,
+            inputs=[video_input],
+            outputs=[video_button, cancel_upload_button, upload_status],
+        )
+        cancel_upload_button.click(
+            _on_cancel_upload,
+            inputs=[],
+            outputs=[video_input, video_button, cancel_upload_button, upload_status],
         )
 
         # Run docs process
@@ -2853,7 +4352,7 @@ if __name__ == "__main__":
 
     app = create_gui(args.theme, logs_in_gui=args.logs_in_gui)
 
-    app.queue()
+    app.queue(default_concurrency_limit=2)
 
     app.launch(
         max_threads=1,

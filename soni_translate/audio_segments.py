@@ -3,6 +3,7 @@ from tqdm import tqdm
 from .utils import run_command
 from .logging_setup import logger
 import numpy as np
+import os
 
 
 class Mixer:
@@ -55,8 +56,19 @@ class Mixer:
 
 def create_translated_audio(
     result_diarize, audio_files, final_file, concat=False, avoid_overlap=False,
+    original_vocals_path=None, sync_enabled=False,
 ):
     total_duration = result_diarize["segments"][-1]["end"]  # in seconds
+
+    # Import sync alignment if enabled
+    sync_fn = None
+    if sync_enabled and original_vocals_path and os.path.exists(original_vocals_path):
+        try:
+            from .sync_alignment import align_tts_to_original
+            sync_fn = align_tts_to_original
+            logger.info("[Sync] Anchor-based sync alignment ENABLED")
+        except ImportError:
+            logger.warning("[Sync] sync_alignment module not found, skipping")
 
     if concat:
         """
@@ -100,6 +112,24 @@ def create_translated_audio(
             zip(result_diarize["segments"], audio_files)
         ):
             start = float(line["start"])
+            end = float(line.get("end", start))
+
+            # Apply sync alignment if enabled
+            if sync_fn:
+                try:
+                    aligned_path = audio_file.replace(".ogg", "_aligned.wav").replace(".wav", "_aligned.wav")
+                    sync_fn(
+                        tts_path=audio_file,
+                        original_vocals_path=original_vocals_path,
+                        segment_start=start,
+                        segment_end=end,
+                        output_path=aligned_path,
+                    )
+                    if os.path.exists(aligned_path) and os.path.getsize(aligned_path) > 0:
+                        audio_file = aligned_path
+                        logger.debug(f"[Sync] Aligned {audio_file}")
+                except Exception as s_err:
+                    logger.warning(f"[Sync] Alignment failed for {audio_file}: {s_err}")
 
             # Overlay each audio at the corresponding time
             try:

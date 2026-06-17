@@ -1,0 +1,4 @@
+# Forces all recursive packages to respect these safe versions
+# Prevents TTS, whisperX, and other older libs from pulling broken numpy/librosa
+numpy==1.23.5
+librosa==0.9.2
