@@ -88,7 +88,7 @@ def retry_segment(
     if segment_index >= len(manifest):
         logger.error(
             f"Segment index {segment_index} out of range "
-            f"(manifest has {len(segments)} segments)"
+            f"(manifest has {len(manifest)} segments)"
         )
         return None
 

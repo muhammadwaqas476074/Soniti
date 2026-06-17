@@ -8,6 +8,7 @@ from soni_translate.logging_setup import (
 import whisperx
 import torch
 import os
+import subprocess
 import threading
 from soni_translate.audio_segments import create_translated_audio
 from soni_translate.text_to_speech import (
@@ -77,10 +78,16 @@ from soni_translate.language_configuration import (
 )
 from soni_translate.utils import (
     remove_files,
+    remove_directory_contents,
     get_link_list,
     get_valid_files,
     run_command,
     copy_files,
+    download_manager,
+    upload_model_list,
+    download_list,
+    is_audio_file,
+    is_subtitle_file,
 )
 
 import shutil
